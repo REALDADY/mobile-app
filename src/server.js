@@ -72,6 +72,8 @@ function buildAddressDisplay(record = {}) {
   ].filter(Boolean).join(', ');
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 async function createOrderInSupabase({ userId, amount, paymentMethod, orderPayload, initialStatus = 'PENDING' }) {
   const { data: order, error } = await supabase.from('orders').insert({
     user_id: userId,
@@ -88,7 +90,8 @@ async function createOrderInSupabase({ userId, amount, paymentMethod, orderPaylo
     const { error: itemsError } = await supabase.from('order_items').insert(
       orderPayload.items.map((item) => ({
         order_id: order.id,
-        product_id: item.productId,
+        // product IDs like "1.5L" are not UUIDs — send null to avoid postgres type error
+        product_id: UUID_RE.test(item.productId || '') ? item.productId : null,
         quantity: item.quantity,
         subtotal: item.subtotal,
         used_credits: item.usedCredits || 0,
@@ -313,54 +316,12 @@ app.post('/api/payment/ngenius/topup', async (req, res) => {
     return res.status(400).json({ error: 'Missing amount or userId' });
   }
 
-  const NI_API_KEY = process.env.NI_API_KEY || 'Yjc3MzM5Y2ItMWEwOC00MWNlLTliYTctNTg0ZGMwOWRiMGIzOjA4ZjgzZDdmLWMyODktNDMyZi04MTZlLTNlYTQ0YjZmYzMzYQ==';
-  const NI_OUTLET_ID = process.env.NI_OUTLET_ID || '6f291f9f-6e76-440f-8feb-01fd43706da1';
-
   try {
-    const tokenResp = await fetch("https://api-gateway.ngenius-payments.com/identity/auth/access-token", {
-      method: "POST",
-      headers: {
-        "Authorization": `Basic ${NI_API_KEY}`,
-        "Content-Type": "application/vnd.ni-identity.v1+json",
-        "Accept": "application/vnd.ni-identity.v1+json"
-      }
-    });
-
-    if (!tokenResp.ok) throw new Error('Failed to authenticate with Network International');
-    const tokenData = await tokenResp.json();
-    const accessToken = tokenData.access_token;
-
-    const orderResp = await fetch(`https://api-gateway.ngenius-payments.com/transactions/outlets/${NI_OUTLET_ID}/orders`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${accessToken}`,
-        "Content-Type": "application/vnd.ni-payment.v2+json",
-        "Accept": "application/vnd.ni-payment.v2+json"
-      },
-      body: JSON.stringify({
-        action: "SALE",
-        amount: { currencyCode: "AED", value: Math.round(amount * 100) },
-        merchantAttributes: {
-          redirectUrl: `customerapp://payment-complete?amount=${amount}&userId=${userId}`,
-          cancelUrl: `customerapp://payment-cancel`,
-          skipConfirmationPage: true
-        },
-        paymentMethods: ["CARD", "APPLE_PAY", "GOOGLE_PAY"],
-        emailAddress: "customer@rswater.ae",
-        billingAddress: { firstName: "Guest", lastName: "Customer", address1: "Dubai", city: "Dubai", countryCode: "AE" }
-      })
-    });
-
-    if (!orderResp.ok) throw new Error('Failed to create N-Genius order');
-    const orderData = await orderResp.json();
-
-    if (orderData._links && orderData._links.payment) {
-      res.json({ paymentUrl: orderData._links.payment.href, orderRef: orderData.reference });
-    } else {
-      throw new Error('N-Genius did not return a payment URL');
-    }
+    const redirectUrl = `customerapp://payment-complete?amount=${amount}&userId=${userId}`;
+    const orderData = await createNGeniusOrder(amount, redirectUrl);
+    res.json(orderData);
   } catch (error) {
-    console.error('N-Genius Error:', error);
+    console.error('N-Genius topup error:', error.message);
     res.status(500).json({ error: 'Payment gateway failed', details: error.message });
   }
 });
@@ -392,13 +353,31 @@ app.post('/api/payment/ngenius/checkout', async (req, res) => {
 async function createNGeniusOrder(amount, redirectUrl) {
   const NI_API_KEY = process.env.NI_API_KEY || 'Yjc3MzM5Y2ItMWEwOC00MWNlLTliYTctNTg0ZGMwOWRiMGIzOjA4ZjgzZDdmLWMyODktNDMyZi04MTZlLTNlYTQ0YjZmYzMzYQ==';
   const NI_OUTLET_ID = process.env.NI_OUTLET_ID || '6f291f9f-6e76-440f-8feb-01fd43706da1';
+
   const tokenResp = await fetch("https://api-gateway.ngenius-payments.com/identity/auth/access-token", {
-    method: "POST", headers: { "Authorization": `Basic ${NI_API_KEY}`, "Content-Type": "application/vnd.ni-identity.v1+json", "Accept": "application/vnd.ni-identity.v1+json" }
+    method: "POST",
+    headers: {
+      "Authorization": `Basic ${NI_API_KEY}`,
+      "Content-Type": "application/vnd.ni-identity.v1+json",
+      "Accept": "application/vnd.ni-identity.v1+json"
+    }
   });
+
+  if (!tokenResp.ok) {
+    const body = await tokenResp.text();
+    console.error(`N-Genius auth failed [${tokenResp.status}]:`, body);
+    throw new Error(`N-Genius authentication failed (${tokenResp.status})`);
+  }
+
   const tokenData = await tokenResp.json();
+
   const orderResp = await fetch(`https://api-gateway.ngenius-payments.com/transactions/outlets/${NI_OUTLET_ID}/orders`, {
     method: "POST",
-    headers: { "Authorization": `Bearer ${tokenData.access_token}`, "Content-Type": "application/vnd.ni-payment.v2+json", "Accept": "application/vnd.ni-payment.v2+json" },
+    headers: {
+      "Authorization": `Bearer ${tokenData.access_token}`,
+      "Content-Type": "application/vnd.ni-payment.v2+json",
+      "Accept": "application/vnd.ni-payment.v2+json"
+    },
     body: JSON.stringify({
       action: "SALE",
       amount: { currencyCode: "AED", value: Math.round(amount * 100) },
@@ -406,7 +385,20 @@ async function createNGeniusOrder(amount, redirectUrl) {
       paymentMethods: ["CARD"]
     })
   });
+
+  if (!orderResp.ok) {
+    const body = await orderResp.text();
+    console.error(`N-Genius order creation failed [${orderResp.status}]:`, body);
+    throw new Error(`N-Genius order creation failed (${orderResp.status}): ${body}`);
+  }
+
   const orderData = await orderResp.json();
+
+  if (!orderData._links?.payment?.href) {
+    console.error('N-Genius response missing payment URL:', JSON.stringify(orderData));
+    throw new Error('N-Genius did not return a payment URL');
+  }
+
   return { paymentUrl: orderData._links.payment.href, orderRef: orderData.reference };
 }
 
