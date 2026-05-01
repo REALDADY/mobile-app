@@ -308,6 +308,24 @@ app.post('/api/users/:id/wallet/buy-credits', async (req, res) => {
   }
 });
 
+// --- Payment redirect relay endpoints ---
+// N-Genius only accepts http/https redirect URLs, so we relay back to the app scheme from here.
+const BASE_URL = process.env.BASE_URL || 'https://mobile-app-production-5491.up.railway.app';
+
+app.get('/api/payment/complete', (req, res) => {
+  const params = new URLSearchParams(req.query).toString();
+  res.redirect(`customerapp://payment-complete${params ? '?' + params : ''}`);
+});
+
+app.get('/api/payment/cancel', (_req, res) => {
+  res.redirect('customerapp://payment-cancel');
+});
+
+app.get('/api/payment/checkout-complete', (req, res) => {
+  const params = new URLSearchParams(req.query).toString();
+  res.redirect(`customerapp://checkout-complete${params ? '?' + params : ''}`);
+});
+
 // --- Network International (N-Genius) Payment Gateway ---
 app.post('/api/payment/ngenius/topup', async (req, res) => {
   const { amount, userId } = req.body;
@@ -317,7 +335,7 @@ app.post('/api/payment/ngenius/topup', async (req, res) => {
   }
 
   try {
-    const redirectUrl = `customerapp://payment-complete?amount=${amount}&userId=${userId}`;
+    const redirectUrl = `${BASE_URL}/api/payment/complete?amount=${amount}&userId=${userId}`;
     const orderData = await createNGeniusOrder(amount, redirectUrl);
     res.json(orderData);
   } catch (error) {
@@ -328,7 +346,6 @@ app.post('/api/payment/ngenius/topup', async (req, res) => {
 
 // --- Orders (Backend Admin/Customer fallback) ---
 app.post('/api/payment/ngenius/checkout', async (req, res) => {
-  // A dedicated endpoint so the cart can actually charge the card + create order securely
   const { amount, userId, orderPayload } = req.body;
   if (!amount || !userId) return res.status(400).json({ error: 'Missing data' });
 
@@ -342,11 +359,12 @@ app.post('/api/payment/ngenius/checkout', async (req, res) => {
     });
 
     const encodedOrderId = encodeURIComponent(order.id);
-    const orderData = await createNGeniusOrder(amount, `customerapp://checkout-complete?orderId=${encodedOrderId}`);
+    const redirectUrl = `${BASE_URL}/api/payment/checkout-complete?orderId=${encodedOrderId}`;
+    const orderData = await createNGeniusOrder(amount, redirectUrl);
     res.json(orderData);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Checkout failed' });
+    console.error('N-Genius checkout error:', err.message);
+    res.status(500).json({ error: 'Checkout failed', details: err.message });
   }
 });
 
@@ -381,7 +399,7 @@ async function createNGeniusOrder(amount, redirectUrl) {
     body: JSON.stringify({
       action: "SALE",
       amount: { currencyCode: "AED", value: Math.round(amount * 100) },
-      merchantAttributes: { redirectUrl, cancelUrl: `customerapp://payment-cancel`, skipConfirmationPage: true },
+      merchantAttributes: { redirectUrl, cancelUrl: `${BASE_URL}/api/payment/cancel`, skipConfirmationPage: true },
       paymentMethods: ["CARD"]
     })
   });
