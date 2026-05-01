@@ -1,0 +1,107 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id              String         @id @default(uuid())
+  phone           String         @unique
+  name            String?
+  nameAr          String?
+  role            String         @default("CUSTOMER") // CUSTOMER, DRIVER, ADMIN
+  address         String?
+  building        String?
+  apartment       String?
+  city            String?
+  locationLat     Float?
+  locationLng     Float?
+  bottleCredits   Int            @default(0) // 5-gallon bottle credits
+  walletBalance   Float          @default(0.0) // AED wallet balance
+  loyaltyPoints   Int            @default(0)
+  emptyBottlesWith Int           @default(0)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  
+  orders          Order[]
+  subscriptions   Subscription[]
+  assignedDeliveries Delivery[]  @relation("DriverDeliveries")
+}
+
+model Product {
+  id              String      @id @default(uuid())
+  name            String
+  description     String?
+  imageUrl        String?
+  price           Float
+  is5Gallon       Boolean     @default(false)
+  depositRequired Float?      @default(0.0) // If 5G bottle, deposit rules apply
+  stock           Int         @default(0)
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  
+  orderItems      OrderItem[]
+}
+
+model Order {
+  id              String      @id @default(uuid())
+  userId          String
+  user            User        @relation(fields: [userId], references: [id])
+  status          String      @default("PENDING") // PENDING, OUT_FOR_DELIVERY, DELIVERED, CANCELLED
+  totalAmount     Float
+  paymentMethod   String      // CASH, CARD, WALLET_CREDITS
+  paymentStatus   String      @default("UNPAID") // UNPAID, PAID
+  notes           String?
+  deliveryAddress String?
+  deliverySlot    String?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  items           OrderItem[]
+  delivery        Delivery?
+}
+
+model OrderItem {
+  id              String      @id @default(uuid())
+  orderId         String
+  order           Order       @relation(fields: [orderId], references: [id])
+  productId       String
+  product         Product     @relation(fields: [productId], references: [id])
+  quantity        Int
+  subtotal        Float
+  usedCredits     Int         @default(0) // Did they use bottle credits for this item?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+}
+
+model Subscription {
+  id              String      @id @default(uuid())
+  userId          String
+  user            User        @relation(fields: [userId], references: [id])
+  frequency       String      // WEEKLY, BIWEEKLY, CUSTOM
+  deliveryDays    String      // E.g., "MONDAY,THURSDAY"
+  status          String      @default("ACTIVE") // ACTIVE, PAUSED, CANCELLED
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+}
+
+model Delivery {
+  id              String      @id @default(uuid())
+  orderId         String      @unique
+  order           Order       @relation(fields: [orderId], references: [id])
+  driverId        String?
+  driver          User?       @relation("DriverDeliveries", fields: [driverId], references: [id])
+  status          String      @default("UNASSIGNED") // UNASSIGNED, ASSIGNED, IN_TRANSIT, DELIVERED
+  bottlesReturned Int         @default(0)
+  bottlesDamaged  Int         @default(0)
+  bottlesMissing  Int         @default(0)
+  deliveredAt     DateTime?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+}
