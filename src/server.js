@@ -1,14 +1,76 @@
 const express = require('express');
 const cors = require('cors');
-const { PrismaClient } = require('@prisma/client');
+const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
+const { createDriverReportService } = require('./driver-report-service');
+const { createDriverCustomerRequestService } = require('./driver-customer-request-service');
 require('dotenv').config();
 
 const app = express();
-const prisma = new PrismaClient();
 
-const SUPABASE_URL = 'https://ubzhbwyuoqhysnzuyvbk.supabase.co';
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InViemhid3l1b3FoeXNuenV5dmJrIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NTYzMjcxNSwiZXhwIjoyMDkxMjA4NzE1fQ.22M0Y6s4Uu1oLpVlWDeL1riCKSnUNuNPTMTGaislxQ0';
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const IS_PRODUCTION = NODE_ENV === 'production';
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
+const DRIVER_API_KEY = process.env.DRIVER_API_KEY;
+const DRIVER_LOGIN_USERNAME = process.env.DRIVER_LOGIN_USERNAME || '';
+const DRIVER_LOGIN_PASSWORD = process.env.DRIVER_LOGIN_PASSWORD || '';
+const DRIVER_LOGIN_ID = process.env.DRIVER_LOGIN_ID || '00000000-0000-4000-8000-000000000001';
+const DRIVER_LOGIN_NAME = process.env.DRIVER_LOGIN_NAME || 'Driver';
+const DRIVER_LOGIN_COUNT = Math.max(1, Math.min(20, Number.parseInt(process.env.DRIVER_LOGIN_COUNT || '7', 10) || 7));
+const DRIVER_SESSION_SECRET = process.env.DRIVER_SESSION_SECRET || DRIVER_API_KEY || '';
+const DELIVERY_PROOF_BUCKET = process.env.DELIVERY_PROOF_BUCKET || 'delivery-proofs';
+const DRIVER_REPORT_BUCKET = process.env.DRIVER_REPORT_BUCKET || 'driver-day-reports';
+const DRIVER_CUSTOMER_REQUEST_BUCKET = process.env.DRIVER_CUSTOMER_REQUEST_BUCKET || 'driver-customer-requests';
+const MAX_DELIVERY_PROOF_BYTES = 5 * 1024 * 1024;
+const CONFIGURED_DRIVERS = Array.from({ length: DRIVER_LOGIN_COUNT }, (_, index) => ({
+  id: index === 0 ? DRIVER_LOGIN_ID : `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+  username: `${DRIVER_LOGIN_USERNAME}${index + 1}`,
+  name: `${DRIVER_LOGIN_NAME} ${index + 1}`,
+}));
+const WEBSITE_DISPATCH_URL = process.env.WEBSITE_DISPATCH_URL || 'http://localhost:4000/api/dispatch/overview';
+const WEBSITE_DISPATCH_WRITE_BASE_URL = (process.env.WEBSITE_DISPATCH_WRITE_BASE_URL
+  || WEBSITE_DISPATCH_URL.replace(/\/overview\/?$/, '')).replace(/\/$/, '');
+const WEBSITE_DISPATCH_WRITE_KEY = process.env.WEBSITE_DISPATCH_WRITE_KEY || '';
+const EMIRATE_BOUNDARIES_URL = process.env.EMIRATE_BOUNDARIES_URL || 'http://localhost:3000/api/emirates';
+const EMIRATE_ORDER = ['Abu Dhabi', 'Dubai', 'Sharjah', 'Ajman', 'Umm Al Quwain', 'Ras Al Khaimah', 'Fujairah'];
+let cachedEmirateBoundaries;
+const API_BASE_URL = (process.env.API_BASE_URL || process.env.BASE_URL || 'http://localhost:5000').replace(/\/$/, '');
+const PAYMENT_RELAY_BASE_URL = (process.env.NGENIUS_REDIRECT_URL || API_BASE_URL).replace(/\/$/, '');
+const APP_SCHEME = process.env.APP_SCHEME || 'alrawdahsprings';
+const PAYMENT_COMPLETE_REDIRECT_URL = process.env.CUSTOMER_APP_REDIRECT_URL || `${APP_SCHEME}://payment-complete`;
+const PAYMENT_CANCEL_REDIRECT_URL = process.env.CUSTOMER_APP_CANCEL_URL || `${APP_SCHEME}://payment-cancel`;
+const CHECKOUT_COMPLETE_REDIRECT_URL = process.env.CUSTOMER_APP_CHECKOUT_REDIRECT_URL || `${APP_SCHEME}://checkout-complete`;
+const NGENIUS_BASE_URL = (process.env.NGENIUS_BASE_URL || 'https://api-gateway.ngenius-payments.com').replace(/\/$/, '');
+const NGENIUS_API_KEY = process.env.NGENIUS_API_KEY || process.env.NI_API_KEY;
+const NGENIUS_OUTLET_ID = process.env.NGENIUS_OUTLET_ID || process.env.NI_OUTLET_ID;
+
+function assertHttpUrl(name, value) {
+  try {
+    const parsed = new URL(value);
+    if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('invalid protocol');
+  } catch {
+    throw new Error(`${name} must be a valid HTTP or HTTPS URL.`);
+  }
+}
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+  throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY. Configure backend environment variables before starting the API.');
+}
+
+assertHttpUrl('SUPABASE_URL', SUPABASE_URL);
+assertHttpUrl('NGENIUS_BASE_URL', NGENIUS_BASE_URL);
+
+if (IS_PRODUCTION && !(process.env.API_BASE_URL || process.env.BASE_URL)) {
+  throw new Error('Missing API_BASE_URL for production payment redirects.');
+}
+
+if (IS_PRODUCTION) {
+  assertHttpUrl('API_BASE_URL', API_BASE_URL);
+  assertHttpUrl('NGENIUS_REDIRECT_URL', PAYMENT_RELAY_BASE_URL);
+}
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: {
     autoRefreshToken: false,
@@ -16,32 +78,35 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
     detectSessionInUrl: false,
   },
 });
+const driverReports = createDriverReportService({
+  supabase,
+  apiBaseUrl: API_BASE_URL,
+  signingSecret: DRIVER_SESSION_SECRET,
+  bucket: DRIVER_REPORT_BUCKET,
+});
+const driverCustomerRequests = createDriverCustomerRequestService({
+  supabase,
+  bucket: DRIVER_CUSTOMER_REQUEST_BUCKET,
+});
 
-const LOCAL_PRODUCT_CATALOG = {
-  '5gal': { name: '5-Gallon Bottle', price: 14, is5Gallon: true },
-  '1.5L': { name: '1.5L Bottle', price: 9, is5Gallon: false },
-  '500ml': { name: '500ml Bottle', price: 12, is5Gallon: false },
-  '250ml': { name: '250ml Bottle', price: 15, is5Gallon: false },
-  '200ml': { name: '200ml Bottle', price: 11, is5Gallon: false },
-  '150ml': { name: '150ml Bottle', price: 10, is5Gallon: false },
-};
+const ALLOWED_ORDER_STATUSES = new Set(['PENDING', 'OUT_FOR_DELIVERY', 'DELIVERED', 'CANCELLED']);
+const ALLOWED_PAYMENT_METHODS = new Set(['cod', 'wallet', 'card']);
+const ALLOWED_PUSH_PLATFORMS = new Set(['ios', 'android', 'web', 'unknown']);
+const ALLOWED_APP_TYPES = new Set(['customer', 'driver', 'admin', 'unknown']);
+const ALLOWED_NOTIFICATION_AUDIENCES = new Set(['all', 'customers', 'drivers', 'specificUsers']);
+const ADMIN_ROLES = new Set(['SUPER_ADMIN', 'ADMIN', 'OPERATIONS', 'DISPATCH', 'FINANCE', 'SUPPORT', 'READ_ONLY']);
+const EXPO_PUSH_SEND_URL = 'https://exp.host/--/api/v2/push/send';
+const EXPO_PUSH_RECEIPTS_URL = 'https://exp.host/--/api/v2/push/getReceipts';
+const latestDriverLocations = new Map();
+const driverShiftStates = new Map();
+const driverGpsSharingStates = new Map();
 
-async function findAuthUserByEmail(email) {
-  const normalizedEmail = email.trim().toLowerCase();
-  let page = 1;
-  const perPage = 200;
-
-  while (true) {
-    const { data, error } = await supabase.auth.admin.listUsers({ page, perPage });
-    if (error) throw error;
-
-    const users = data?.users || [];
-    const match = users.find((user) => user.email?.toLowerCase() === normalizedEmail);
-    if (match) return match;
-
-    if (users.length < perPage) return null;
-    page += 1;
-  }
+function getDriverShiftState(driverId) {
+  return driverShiftStates.get(driverId) || {
+    status: 'ON_DUTY',
+    startedAt: null,
+    endedAt: null,
+  };
 }
 
 async function listAllAuthUsers() {
@@ -72,154 +137,1381 @@ function buildAddressDisplay(record = {}) {
   ].filter(Boolean).join(', ');
 }
 
+function isExpoPushToken(token) {
+  return /^Expo(nent)?PushToken\[[A-Za-z0-9_-]+\]$/.test(String(token || '').trim());
+}
+
+function normalizePushPlatform(platform) {
+  const value = String(platform || 'unknown').toLowerCase();
+  return ALLOWED_PUSH_PLATFORMS.has(value) ? value : 'unknown';
+}
+
+function normalizeAppType(appType) {
+  const value = String(appType || 'unknown').toLowerCase();
+  return ALLOWED_APP_TYPES.has(value) ? value : 'unknown';
+}
+
+function truncateText(value, maxLength) {
+  const text = String(value || '').trim();
+  return text.length > maxLength ? text.slice(0, maxLength) : text;
+}
+
+function fireAndForgetNotification(task) {
+  Promise.resolve()
+    .then(task)
+    .catch((error) => logError('Push notification failed', error));
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+function requireApiKey(allowedKeys) {
+  const configuredKeys = allowedKeys.filter(Boolean);
+
+  return (req, res, next) => {
+    if (configuredKeys.length === 0) {
+      if (!IS_PRODUCTION) {
+        console.warn('Admin/driver API key is not configured; allowing request in development mode.');
+        return next();
+      }
+
+      return res.status(503).json({ error: 'Operations API key is not configured' });
+    }
+
+    const providedKey = req.get('x-api-key');
+    if (providedKey && configuredKeys.some((key) => safeCompare(key, providedKey))) return next();
+
+    return res.status(401).json({ error: 'Unauthorized' });
+  };
+}
+
+const requireAdmin = requireApiKey([ADMIN_API_KEY]);
+const requireOperationsAccess = requireApiKey([ADMIN_API_KEY, DRIVER_API_KEY]);
+
+function requireDispatchReadOnly(req, res, next) {
+  const remoteAddress = req.ip || req.socket?.remoteAddress || '';
+  const isLoopback = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remoteAddress);
+  if (isLoopback) return next();
+  return requireOperationsAccess(req, res, next);
+}
+
+function safeCompare(expected, actual) {
+  const expectedBuffer = Buffer.from(String(expected));
+  const actualBuffer = Buffer.from(String(actual));
+  return expectedBuffer.length === actualBuffer.length && crypto.timingSafeEqual(expectedBuffer, actualBuffer);
+}
+
+function getBearerToken(req) {
+  const header = req.get('authorization') || '';
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : '';
+}
+
+async function requireCustomerAuth(req, res, next) {
+  try {
+    const token = getBearerToken(req);
+    if (!token) return res.status(401).json({ error: 'Authentication required' });
+
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data?.user?.id) return res.status(401).json({ error: 'Invalid or expired session' });
+
+    req.authUser = data.user;
+    return next();
+  } catch (error) {
+    logError('Customer auth failed', error);
+    return res.status(401).json({ error: 'Invalid or expired session' });
+  }
+}
+
+function requireSameCustomer(req, res, userId) {
+  if (!UUID_RE.test(String(userId || ''))) {
+    res.status(400).json({ error: 'Invalid user id' });
+    return null;
+  }
+
+  if (!req.authUser?.id || req.authUser.id !== userId) {
+    res.status(403).json({ error: 'You are not allowed to access this account' });
+    return null;
+  }
+
+  return userId;
+}
+
+async function requireDriverAuth(req, res, next) {
+  try {
+    const token = getBearerToken(req);
+    if (!token) return res.status(401).json({ error: 'Authentication required' });
+
+    const localDriver = verifyConfiguredDriverToken(token);
+    if (localDriver) {
+      req.authUser = {
+        id: localDriver.id,
+        phone: '',
+        user_metadata: { name: localDriver.name, username: localDriver.username, role: 'DRIVER' },
+      };
+      req.driverProfile = { id: localDriver.id, name: localDriver.name, role: 'DRIVER' };
+      return next();
+    }
+
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data?.user?.id) return res.status(401).json({ error: 'Invalid or expired session' });
+
+    const { data: profile, error: profileError } = await supabase
+      .from('users')
+      .select('id, name, role')
+      .eq('id', data.user.id)
+      .single();
+
+    if (profileError || !profile || profile.role !== 'DRIVER') {
+      return res.status(403).json({ error: 'Driver access required' });
+    }
+
+    req.authUser = data.user;
+    req.driverProfile = profile;
+    return next();
+  } catch (error) {
+    logError('Driver auth failed', error);
+    return res.status(401).json({ error: 'Invalid or expired session' });
+  }
+}
+
+function createConfiguredDriverToken(driver) {
+  const payload = Buffer.from(JSON.stringify({
+    id: driver.id,
+    name: driver.name,
+    username: driver.username,
+    exp: Math.floor(Date.now() / 1000) + (12 * 60 * 60),
+  })).toString('base64url');
+  const signature = crypto.createHmac('sha256', DRIVER_SESSION_SECRET).update(payload).digest('base64url');
+  return `driver.${payload}.${signature}`;
+}
+
+function verifyConfiguredDriverToken(token) {
+  if (!DRIVER_SESSION_SECRET || !token.startsWith('driver.')) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [, payload, providedSignature] = parts;
+  const expectedSignature = crypto.createHmac('sha256', DRIVER_SESSION_SECRET).update(payload).digest('base64url');
+  if (!safeCompare(expectedSignature, providedSignature)) return null;
+
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    const driver = CONFIGURED_DRIVERS.find((candidate) => candidate.id === parsed.id && candidate.username === parsed.username);
+    if (!driver || Number(parsed.exp) <= Math.floor(Date.now() / 1000)) return null;
+    return { ...parsed, name: driver.name };
+  } catch {
+    return null;
+  }
+}
+
+function createDeliveryAssignmentToken({ orderId, driverId, source }) {
+  const payload = Buffer.from(JSON.stringify({
+    orderId,
+    driverId,
+    source,
+    exp: Math.floor(Date.now() / 1000) + (24 * 60 * 60),
+  })).toString('base64url');
+  const signature = crypto.createHmac('sha256', DRIVER_SESSION_SECRET).update(payload).digest('base64url');
+  return `assignment.${payload}.${signature}`;
+}
+
+function verifyDeliveryAssignmentToken(token, { orderId, driverId }) {
+  if (!DRIVER_SESSION_SECRET || typeof token !== 'string' || !token.startsWith('assignment.')) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [, payload, providedSignature] = parts;
+  const expectedSignature = crypto.createHmac('sha256', DRIVER_SESSION_SECRET).update(payload).digest('base64url');
+  if (!safeCompare(expectedSignature, providedSignature)) return null;
+
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    if (parsed.orderId !== orderId || parsed.driverId !== driverId || Number(parsed.exp) <= Math.floor(Date.now() / 1000)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function parseStoredOrderNotes(value) {
+  if (!value) return {};
+  if (typeof value === 'object' && !Array.isArray(value)) return value;
+  try {
+    const parsed = JSON.parse(String(value));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return { deliveryInstructions: String(value) };
+  }
+}
+
+let deliveryProofBucketPromise;
+async function ensureDeliveryProofBucket() {
+  if (!deliveryProofBucketPromise) {
+    deliveryProofBucketPromise = (async () => {
+      const { data, error } = await supabase.storage.getBucket(DELIVERY_PROOF_BUCKET);
+      if (data && !error) return;
+      const { error: createError } = await supabase.storage.createBucket(DELIVERY_PROOF_BUCKET, {
+        public: false,
+        fileSizeLimit: MAX_DELIVERY_PROOF_BYTES,
+        allowedMimeTypes: ['image/jpeg', 'image/png', 'image/webp'],
+      });
+      const alreadyExists = /already exists|duplicate/i.test(String(createError?.message || ''));
+      if (createError && !alreadyExists) throw createError;
+    })().catch((error) => {
+      deliveryProofBucketPromise = undefined;
+      throw error;
+    });
+  }
+  return deliveryProofBucketPromise;
+}
+
+async function uploadDeliveryProof({ orderId, driverId, proofPhoto }) {
+  const suppliedMimeType = String(proofPhoto?.mimeType || '').toLowerCase().replace('image/jpg', 'image/jpeg');
+  const rawPhoto = String(proofPhoto?.base64 || '').trim();
+  const dataUrlMatch = rawPhoto.match(/^data:(image\/(?:jpeg|jpg|png|webp));base64,(.+)$/is);
+  const embeddedMimeType = dataUrlMatch?.[1]?.toLowerCase().replace('image/jpg', 'image/jpeg');
+  let base64 = String(dataUrlMatch?.[2] || rawPhoto).replace(/\s/g, '').replace(/-/g, '+').replace(/_/g, '/');
+  base64 += '='.repeat((4 - (base64.length % 4)) % 4);
+  if (!['image/jpeg', 'image/png', 'image/webp'].includes(embeddedMimeType || suppliedMimeType) || !base64 || !/^[A-Za-z0-9+/]+={0,2}$/.test(base64)) {
+    throw validationError('A valid proof-of-delivery photo is required');
+  }
+
+  const bytes = Buffer.from(base64, 'base64');
+  if (bytes.length < 1024 || bytes.length > MAX_DELIVERY_PROOF_BYTES) {
+    throw validationError('Proof photo must be between 1 KB and 5 MB');
+  }
+
+  const detectedMimeType = bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff
+    ? 'image/jpeg'
+    : bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+      ? 'image/png'
+      : bytes.subarray(0, 4).toString('ascii') === 'RIFF' && bytes.subarray(8, 12).toString('ascii') === 'WEBP'
+        ? 'image/webp'
+        : null;
+  if (!detectedMimeType) throw validationError('Proof photo must be a JPEG, PNG, or WebP image');
+
+  await ensureDeliveryProofBucket();
+  const mimeType = detectedMimeType;
+  const extension = mimeType === 'image/png' ? 'png' : mimeType === 'image/webp' ? 'webp' : 'jpg';
+  const safeOrderId = orderId.replace(/[^A-Za-z0-9._-]/g, '_');
+  const path = `${safeOrderId}/${Date.now()}-${crypto.randomBytes(8).toString('hex')}.${extension}`;
+  const { error } = await supabase.storage.from(DELIVERY_PROOF_BUCKET).upload(path, bytes, {
+    contentType: mimeType,
+    cacheControl: '3600',
+    upsert: false,
+    metadata: { orderId, driverId },
+  });
+  if (error) throw error;
+  return { bucket: DELIVERY_PROOF_BUCKET, path, mimeType, size: bytes.length };
+}
+
+function polygonsForGeometry(geometry) {
+  if (geometry?.type === 'Polygon') return [geometry.coordinates];
+  if (geometry?.type === 'MultiPolygon') return geometry.coordinates;
+  return [];
+}
+
+function pointInRing(ring, point) {
+  let inside = false;
+  for (let current = 0, previous = ring.length - 1; current < ring.length; previous = current++) {
+    const [currentLongitude, currentLatitude] = ring[current];
+    const [previousLongitude, previousLatitude] = ring[previous];
+    const crossesLatitude = (currentLatitude > point.latitude) !== (previousLatitude > point.latitude);
+    const intersectionLongitude = ((previousLongitude - currentLongitude) * (point.latitude - currentLatitude))
+      / ((previousLatitude - currentLatitude) || Number.EPSILON) + currentLongitude;
+    if (crossesLatitude && point.longitude < intersectionLongitude) inside = !inside;
+  }
+  return inside;
+}
+
+function geometryContainsPoint(geometry, point) {
+  return polygonsForGeometry(geometry).some((polygon) => {
+    if (!polygon.length || !pointInRing(polygon[0], point)) return false;
+    return !polygon.slice(1).some((hole) => pointInRing(hole, point));
+  });
+}
+
+function pointToSegmentDistance(point, start, end) {
+  const longitudeScale = Math.cos(point.latitude * Math.PI / 180);
+  const pointX = point.longitude * longitudeScale;
+  const startX = start[0] * longitudeScale;
+  const endX = end[0] * longitudeScale;
+  const segmentX = endX - startX;
+  const segmentY = end[1] - start[1];
+  const lengthSquared = (segmentX * segmentX) + (segmentY * segmentY);
+  const projection = lengthSquared
+    ? Math.max(0, Math.min(1, (((pointX - startX) * segmentX) + ((point.latitude - start[1]) * segmentY)) / lengthSquared))
+    : 0;
+  return Math.hypot(pointX - (startX + projection * segmentX), point.latitude - (start[1] + projection * segmentY));
+}
+
+function distanceToGeometry(geometry, point) {
+  if (geometryContainsPoint(geometry, point)) return 0;
+  let closest = Number.POSITIVE_INFINITY;
+  for (const polygon of polygonsForGeometry(geometry)) {
+    for (const ring of polygon) {
+      for (let index = 1; index < ring.length; index += 1) {
+        closest = Math.min(closest, pointToSegmentDistance(point, ring[index - 1], ring[index]));
+      }
+    }
+  }
+  return closest;
+}
+
+async function getEmirateBoundaries() {
+  if (cachedEmirateBoundaries) return cachedEmirateBoundaries;
+  const response = await fetch(EMIRATE_BOUNDARIES_URL, { headers: { Accept: 'application/json' } });
+  if (!response.ok) throw new Error(`Emirate boundary feed returned ${response.status}`);
+  const payload = await response.json();
+  const boundaries = new Map((payload.features || []).map((feature) => [feature.properties?.Emirate_En, feature.geometry]));
+  if (EMIRATE_ORDER.some((emirate) => !boundaries.has(emirate))) throw new Error('Emirate boundary feed is incomplete');
+  cachedEmirateBoundaries = boundaries;
+  return boundaries;
+}
+
+function emirateForPoint(boundaries, point) {
+  const containing = EMIRATE_ORDER.find((emirate) => geometryContainsPoint(boundaries.get(emirate), point));
+  if (containing) return containing;
+  return EMIRATE_ORDER.reduce((closest, emirate) => (
+    distanceToGeometry(boundaries.get(emirate), point) < distanceToGeometry(boundaries.get(closest), point) ? emirate : closest
+  ));
+}
+
+function optimizeStopOrder(stops, origin) {
+  const remaining = [...stops];
+  const optimized = [];
+  let current = origin || (remaining[0] ? { latitude: remaining[0].latitude, longitude: remaining[0].longitude } : null);
+  while (remaining.length) {
+    let nextIndex = 0;
+    if (current) {
+      let closest = Number.POSITIVE_INFINITY;
+      remaining.forEach((stop, index) => {
+        const distance = Math.hypot(stop.latitude - current.latitude, (stop.longitude - current.longitude) * Math.cos(current.latitude * Math.PI / 180));
+        if (distance < closest) {
+          closest = distance;
+          nextIndex = index;
+        }
+      });
+    }
+    const [next] = remaining.splice(nextIndex, 1);
+    optimized.push(next);
+    current = { latitude: next.latitude, longitude: next.longitude };
+  }
+  return optimized;
+}
+
+async function getConfiguredDriverRoute(driverId) {
+  const driverIndex = CONFIGURED_DRIVERS.findIndex((driver) => driver.id === driverId);
+  if (driverIndex < 0) return [];
+
+  const [websiteResult, operationsResult, boundaries, catalog] = await Promise.all([
+    fetch(WEBSITE_DISPATCH_URL, { headers: { Accept: 'application/json' } })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Website dispatch feed returned ${response.status}`);
+        return response.json();
+      })
+      .catch(() => ({ orders: [] })),
+    supabase
+      .from('orders')
+      .select('*, user:users(name, phone, email, address, building, apartment, city, location_lat, location_lng), items:order_items(*)')
+      .in('status', ['PENDING', 'OUT_FOR_DELIVERY'])
+      .order('created_at', { ascending: true }),
+    getEmirateBoundaries(),
+    getProductCatalogMap(),
+  ]);
+
+  if (operationsResult.error) throw operationsResult.error;
+
+  const websiteStops = (websiteResult.orders || []).flatMap((order) => {
+    if (order.latitude == null || order.longitude == null) return [];
+    const latitude = Number(order.latitude);
+    const longitude = Number(order.longitude);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return [];
+    return [{
+      id: order.id,
+      orderId: order.id,
+      orderNumber: order.orderNumber || order.id,
+      customerName: order.customerName || 'Customer',
+      customerPhone: order.customerPhone || '',
+      address: order.address || '',
+      latitude,
+      longitude,
+      status: 'ASSIGNED',
+      cashDue: String(order.paymentMethod || '').toLowerCase() === 'cash_on_delivery'
+        && String(order.paymentStatus || '').toLowerCase() !== 'paid'
+        ? Number(order.totalAmount || order.total || 0)
+        : 0,
+      totalAmount: Number(order.totalAmount || order.total || 0),
+      paymentMethod: order.paymentMethod || '',
+      paymentStatus: order.paymentStatus || '',
+      orderStatus: order.status || '',
+      referral: order.referral || {},
+      deliveryDate: order.deliveryDate || '',
+      deliverySlot: order.deliverySlot || '',
+      deliveryInstructions: order.deliveryNotes || order.deliveryInstructions || '',
+      items: Array.isArray(order.items) ? order.items.map((item) => ({
+        id: item.id,
+        productId: item.productId || '',
+        name: [item.productName || item.name || 'Order item', item.productSize].filter(Boolean).join(' · '),
+        quantity: Number(item.quantity || 0),
+        unitPrice: Number(item.unitPrice || 0),
+        subtotal: Number(item.totalPrice ?? item.lineSubtotal ?? item.subtotal ?? 0),
+        depositTotal: Number(item.depositTotal || 0),
+      })) : [],
+      source: 'website',
+    }];
+  });
+
+  const operationsStops = (operationsResult.data || []).flatMap((order) => {
+    const customer = order.user || {};
+    const notes = parseStoredOrderNotes(order.notes);
+    const latitude = Number(order.latitude ?? customer.location_lat);
+    const longitude = Number(order.longitude ?? customer.location_lng);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return [];
+    return [{
+      id: order.id,
+      orderId: order.id,
+      orderNumber: order.id,
+      customerName: customer.name || 'Customer',
+      customerPhone: customer.phone || '',
+      address: order.delivery_address || buildAddressDisplay(customer),
+      latitude,
+      longitude,
+      status: 'ASSIGNED',
+      cashDue: order.payment_method === 'cod' ? Number(order.total_amount || 0) : 0,
+      totalAmount: Number(order.total_amount || 0),
+      paymentMethod: String(order.payment_method || '').toUpperCase(),
+      paymentStatus: String(order.payment_status || '').toUpperCase(),
+      deliverySlot: order.delivery_slot || '',
+      deliveryInstructions: notes.deliveryInstructions || '',
+      items: (order.items || []).map((item) => {
+        const productId = item.product_code || item.product_id || '';
+        const product = catalog.get(String(productId));
+        const quantity = Number(item.quantity || 0);
+        const subtotal = Number(item.subtotal || 0);
+        return {
+          id: item.id,
+          productId,
+          name: product?.name || productId || 'Order item',
+          quantity,
+          unitPrice: quantity > 0 ? Number((subtotal / quantity).toFixed(2)) : Number(product?.price || 0),
+          subtotal,
+          usedCredits: Number(item.used_credits || 0),
+        };
+      }),
+      source: 'operations',
+    }];
+  });
+
+  const positionedDrivers = CONFIGURED_DRIVERS.flatMap((driver) => {
+    const location = latestDriverLocations.get(driver.id);
+    const latitude = Number(location?.lat);
+    const longitude = Number(location?.lng);
+    return Number.isFinite(latitude) && Number.isFinite(longitude)
+      ? [{ id: driver.id, latitude, longitude }]
+      : [];
+  });
+
+  const plannedForDriver = [...websiteStops, ...operationsStops].filter((stop) => {
+    if (positionedDrivers.length) {
+      const closestDriver = positionedDrivers.reduce((closest, candidate) => {
+        const closestDistance = Math.hypot(stop.latitude - closest.latitude, stop.longitude - closest.longitude);
+        const candidateDistance = Math.hypot(stop.latitude - candidate.latitude, stop.longitude - candidate.longitude);
+        return candidateDistance < closestDistance ? candidate : closest;
+      });
+      return closestDriver.id === driverId;
+    }
+
+    const emirate = emirateForPoint(boundaries, { latitude: stop.latitude, longitude: stop.longitude });
+    return CONFIGURED_DRIVERS[EMIRATE_ORDER.indexOf(emirate) % CONFIGURED_DRIVERS.length]?.id === driverId;
+  });
+
+  const location = latestDriverLocations.get(driverId);
+  const optimized = optimizeStopOrder(plannedForDriver, location ? { latitude: Number(location.lat), longitude: Number(location.lng) } : null);
+  return optimized.map((stop, index) => ({ ...stop, routeSequence: index + 1 }));
+}
+
+function buildRedirectUrl(targetUrl, params = {}) {
+  const query = new URLSearchParams(params);
+  return `${targetUrl}${query.toString() ? `?${query.toString()}` : ''}`;
+}
+
+function getPublicErrorMessage(error, fallback = 'Request failed') {
+  if (error?.isValidationError) return error.message;
+  if (error?.message === 'Unsupported phone provider') {
+    return 'SMS OTP is not enabled in Supabase Auth. Enable the phone provider before requesting codes.';
+  }
+  return IS_PRODUCTION ? fallback : (error?.message || fallback);
+}
+
+function validationError(message) {
+  const error = new Error(message);
+  error.isValidationError = true;
+  return error;
+}
+
+function normalizeUaePhone(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (!digits) return '';
+  if (digits.startsWith('971') && digits.length === 12) return `+${digits}`;
+  if (digits.startsWith('0') && digits.length === 10) return `+971${digits.slice(1)}`;
+  if (digits.length === 9 && digits.startsWith('5')) return `+971${digits}`;
+  return String(phone || '').trim();
+}
+
+const reverseGeocodeCache = new Map();
+async function reverseGeocodeUae(latitude, longitude) {
+  const cacheKey = `${latitude.toFixed(5)},${longitude.toFixed(5)}`;
+  if (reverseGeocodeCache.has(cacheKey)) return reverseGeocodeCache.get(cacheKey);
+  const url = new URL('https://nominatim.openstreetmap.org/reverse');
+  url.searchParams.set('format', 'jsonv2');
+  url.searchParams.set('lat', String(latitude));
+  url.searchParams.set('lon', String(longitude));
+  url.searchParams.set('zoom', '18');
+  url.searchParams.set('addressdetails', '1');
+  const response = await fetch(url, {
+    headers: { Accept: 'application/json', 'User-Agent': 'Delivery-Driver-Operations/1.0' },
+    signal: AbortSignal.timeout(8_000),
+  });
+  if (!response.ok) throw new Error(`Reverse geocoding returned ${response.status}`);
+  const payload = await response.json();
+  const addressParts = payload.address || {};
+  const result = {
+    address: String(payload.display_name || `${latitude.toFixed(6)}, ${longitude.toFixed(6)}`),
+    city: String(addressParts.city || addressParts.town || addressParts.village || addressParts.county || addressParts.state || ''),
+    country: String(addressParts.country || 'United Arab Emirates'),
+  };
+  if (reverseGeocodeCache.size >= 500) reverseGeocodeCache.delete(reverseGeocodeCache.keys().next().value);
+  reverseGeocodeCache.set(cacheKey, result);
+  return result;
+}
+
+function assertUaeCoordinates(latitude, longitude) {
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)
+    || latitude < 22 || latitude > 27 || longitude < 51 || longitude > 57) {
+    throw validationError('Capture a valid GPS location inside the UAE');
+  }
+}
+
+async function activateDriverCreatedCustomer(request) {
+  const authUsers = await listAllAuthUsers();
+  const duplicate = authUsers.find((user) => normalizeUaePhone(user.phone || user.user_metadata?.phone) === request.phone);
+  if (duplicate) throw validationError('A customer account already exists with this phone number');
+
+  const email = request.email || phoneProfileEmail(request.phone);
+  const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+    phone: request.phone,
+    email,
+    user_metadata: { phone: request.phone, name: request.customerName, role: 'CUSTOMER', source: 'driver_request' },
+    email_confirm: true,
+    phone_confirm: true,
+  });
+  if (authError) {
+    if (isDuplicateAuthUserError(authError)) throw validationError('A customer account already exists with this phone number or email');
+    throw authError;
+  }
+  if (!authData?.user?.id) throw new Error('Could not create customer account');
+
+  const profile = {
+    id: authData.user.id,
+    email,
+    phone: request.phone,
+    name: request.customerName,
+    role: 'CUSTOMER',
+    address: request.address,
+    city: request.city || '',
+    location_lat: request.latitude,
+    location_lng: request.longitude,
+  };
+  let result = await supabase.from('users').insert(profile).select().single();
+  if (result.error?.code === '42703') {
+    delete profile.phone;
+    result = await supabase.from('users').insert(profile).select().single();
+  }
+  if (result.error) {
+    await supabase.auth.admin.deleteUser(authData.user.id).catch(() => undefined);
+    throw result.error;
+  }
+  return result.data;
+}
+
+function phoneProfileEmail(phone) {
+  return `${phone.replace(/\D/g, '')}@phone.rswater.ae`;
+}
+
+function isDuplicateAuthUserError(error) {
+  const message = String(error?.message || '').toLowerCase();
+  return message.includes('already') || message.includes('registered') || message.includes('duplicate');
+}
+
+function isSchemaSetupError(error) {
+  const message = String(error?.message || '').toLowerCase();
+  const code = String(error?.code || '');
+  return code === '42P01' || code === '42703' || message.includes('does not exist') || message.includes('schema cache');
+}
+
+async function ensurePhoneAuthUser(phone, role) {
+  const { error } = await supabase.auth.admin.createUser({
+    phone,
+    email: phoneProfileEmail(phone),
+    user_metadata: { phone, role },
+    email_confirm: true,
+  });
+
+  if (error && !isDuplicateAuthUserError(error)) throw error;
+}
+
+function logError(context, error) {
+  console.error(context, {
+    message: error?.message || String(error),
+    status: error?.status || error?.code,
+  });
+}
+
+function generateOrderId() {
+  return crypto.randomUUID();
+}
+
+async function getBottleCredits(userId) {
+  const { data, error } = await supabase
+    .from('users')
+    .select('bottle_credits')
+    .eq('id', userId)
+    .single();
+
+  if (error) throw error;
+  return data?.bottle_credits || 0;
+}
+
+async function getCustomerBalances(userId) {
+  const { data, error } = await supabase
+    .from('users')
+    .select('wallet_balance, bottle_credits, loyalty_points')
+    .eq('id', userId)
+    .single();
+
+  if (error) throw error;
+  return {
+    walletBalance: Number(data?.wallet_balance || 0),
+    bottleCredits: Number(data?.bottle_credits || 0),
+    loyaltyPoints: Number(data?.loyalty_points || 0),
+  };
+}
+
+function calculateDeliveryFee(_itemsTotalAfterCoupons) {
+  return 0;
+}
+
+function mapProductRecord(product) {
+  return {
+    id: product.code || product.id,
+    dbId: product.id,
+    code: product.code || null,
+    name: product.name,
+    category: product.description || 'Water',
+    description: product.description || '',
+    imageUrl: product.image_url || null,
+    price: Number(product.price || 0),
+    is5Gallon: Boolean(product.is_5_gallon),
+    depositRequired: Number(product.deposit_required || 0),
+    stock: Number(product.stock || 0),
+  };
+}
+
+async function loadCatalogProducts() {
+  let { data, error } = await supabase
+    .from('products')
+    .select('id, code, name, description, image_url, price, is_5_gallon, deposit_required, stock')
+    .order('created_at', { ascending: true });
+
+  if (error?.message?.includes('products.code')) {
+    const fallback = await supabase
+      .from('products')
+      .select('id, name, description, image_url, price, is_5_gallon, deposit_required, stock')
+      .order('created_at', { ascending: true });
+    data = fallback.data;
+    error = fallback.error;
+  }
+
+  if (error) throw error;
+  return (data || []).map(mapProductRecord);
+}
+
+async function getProductCatalogMap() {
+  const products = await loadCatalogProducts();
+  const catalog = new Map();
+  products.forEach((product) => {
+    catalog.set(String(product.id), product);
+    catalog.set(String(product.dbId), product);
+    if (product.code) catalog.set(String(product.code), product);
+  });
+  return catalog;
+}
+
+function mapCouponPackRecord(pack) {
+  return {
+    id: pack.code || pack.id,
+    dbId: pack.id,
+    label: pack.label,
+    price: Number(pack.price || 0),
+    baseCoupons: Number(pack.base_coupons || 0),
+    bonusCoupons: Number(pack.bonus_coupons || 0),
+    totalCoupons: Number(pack.base_coupons || 0) + Number(pack.bonus_coupons || 0),
+  };
+}
+
+async function loadCouponPacks() {
+  const { data, error } = await supabase
+    .from('coupon_packs')
+    .select('id, code, label, price, base_coupons, bonus_coupons, is_active')
+    .eq('is_active', true)
+    .order('price', { ascending: false });
+
+  if (error) throw error;
+  return (data || []).map(mapCouponPackRecord);
+}
+
+async function getCouponPack(packId) {
+  const cleanPackId = String(packId || '').trim();
+  const packs = await loadCouponPacks();
+  return packs.find((pack) => pack.id === cleanPackId || pack.dbId === cleanPackId) || null;
+}
+
+async function validateOrderItems(items = []) {
+  if (!Array.isArray(items) || items.length === 0) {
+    throw new Error('Order must include at least one item');
+  }
+
+  const catalog = await getProductCatalogMap();
+
+  return items.map((item) => {
+    const productId = String(item.productId || '').trim();
+    const catalogProduct = catalog.get(productId);
+    const quantity = Number(item.quantity);
+
+    if (!catalogProduct) {
+      throw validationError(`Unknown product: ${productId}`);
+    }
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 99) {
+      throw validationError(`Invalid quantity for ${productId}`);
+    }
+
+    const expectedSubtotal = catalogProduct.price * quantity;
+    const subtotal = Number(item.subtotal);
+    if (!Number.isFinite(subtotal) || Math.abs(subtotal - expectedSubtotal) > 0.01) {
+      throw validationError(`Invalid subtotal for ${productId}`);
+    }
+
+    const requestedCoupons = Math.max(0, Number(item.usedCredits || item.couponsToUse || 0));
+    if (!Number.isInteger(requestedCoupons) || requestedCoupons > quantity || (requestedCoupons > 0 && !catalogProduct.is5Gallon)) {
+      throw validationError(`Invalid 5-gallon coupons for ${productId}`);
+    }
+
+    const usedCredits = catalogProduct.is5Gallon ? requestedCoupons : 0;
+
+    return { productId, quantity, subtotal: expectedSubtotal, usedCredits, catalogProduct };
+  });
+}
+
+function calculateOrderPricing(items) {
+  const subtotal = items.reduce((sum, item) => sum + item.subtotal, 0);
+  const couponDiscount = items.reduce((sum, item) => sum + (item.usedCredits * item.catalogProduct.price), 0);
+  const goodsSubtotal = Number(Math.max(0, subtotal - couponDiscount).toFixed(2));
+  const deliveryFee = calculateDeliveryFee(goodsSubtotal);
+  const taxableAmount = Number((goodsSubtotal + deliveryFee).toFixed(2));
+  const vat = Number((taxableAmount * 0.05).toFixed(2));
+  const total = Number((taxableAmount + vat).toFixed(2));
+
+  return {
+    subtotal: Number(subtotal.toFixed(2)),
+    couponDiscount: Number(couponDiscount.toFixed(2)),
+    goodsSubtotal,
+    deliveryFee,
+    vat,
+    total,
+  };
+}
+
+function normalizeOrderPayload(orderPayload = {}) {
+  const emptyBottlesReturned = Number(orderPayload.emptyBottlesReturned ?? orderPayload.empty_bottles_returned ?? 0);
+
+  return {
+    ...orderPayload,
+    address: String(
+      orderPayload.address ||
+      orderPayload.deliveryAddress ||
+      orderPayload.delivery_address ||
+      ''
+    ).trim(),
+    deliveryInstructions: String(orderPayload.deliveryInstructions || orderPayload.notes || '').trim(),
+    emptyBottlesReturned: Number.isInteger(emptyBottlesReturned) && emptyBottlesReturned > 0 ? emptyBottlesReturned : 0,
+    items: Array.isArray(orderPayload.items) ? orderPayload.items : [],
+  };
+}
+
 async function createOrderInSupabase({ userId, amount, paymentMethod, orderPayload, initialStatus = 'PENDING' }) {
+  const normalizedOrderPayload = normalizeOrderPayload(orderPayload);
+  const safeAmount = Number(amount);
+  if (!Number.isFinite(safeAmount) || safeAmount < 0) {
+    throw validationError('Invalid order amount');
+  }
+  const normalizedPaymentMethod = String(paymentMethod || 'cod').toLowerCase();
+  if (!ALLOWED_PAYMENT_METHODS.has(normalizedPaymentMethod)) {
+    throw validationError('Invalid payment method');
+  }
+
+  if (!normalizedOrderPayload.address) {
+    throw validationError('Delivery address is required');
+  }
+
+  const items = await validateOrderItems(normalizedOrderPayload.items);
+  const usedCreditsTotal = items.reduce((sum, item) => sum + item.usedCredits, 0);
+  const fiveGallonQuantity = items.reduce((sum, item) => (
+    sum + (item.catalogProduct.is5Gallon ? item.quantity : 0)
+  ), 0);
+  if (normalizedOrderPayload.emptyBottlesReturned > fiveGallonQuantity) {
+    throw validationError('Returned empty bottles cannot exceed ordered 5-gallon bottles');
+  }
+
+  const pricing = calculateOrderPricing(items);
+  const expectedTotal = pricing.total;
+  const earnedLoyaltyPoints = normalizedPaymentMethod === 'card' ? 0 : Math.floor(expectedTotal);
+
+  if (Math.abs(safeAmount - expectedTotal) > 0.01) {
+    throw validationError(`Invalid order total. Expected ${expectedTotal.toFixed(2)} AED`);
+  }
+
+  const balances = await getCustomerBalances(userId);
+  if (usedCreditsTotal > 0 && balances.bottleCredits < usedCreditsTotal) {
+    throw validationError('Insufficient 5-gallon coupons');
+  }
+  if (normalizedPaymentMethod === 'wallet' && balances.walletBalance < expectedTotal) {
+    throw validationError('Insufficient wallet balance');
+  }
+
   const { data: order, error } = await supabase.from('orders').insert({
+    id: generateOrderId(),
     user_id: userId,
-    total_amount: amount,
-    payment_method: paymentMethod,
-    delivery_address: orderPayload.address,
+    total_amount: expectedTotal,
+    payment_method: normalizedPaymentMethod,
+    payment_status: normalizedPaymentMethod === 'wallet' ? 'PAID' : 'UNPAID',
+    delivery_address: normalizedOrderPayload.address,
     status: initialStatus,
-    delivery_slot: orderPayload.deliverySlot || null,
+    delivery_slot: normalizedOrderPayload.deliverySlot || null,
+    notes: JSON.stringify({
+      pricing,
+      deliveryInstructions: normalizedOrderPayload.deliveryInstructions || '',
+      emptyBottlesReturned: normalizedOrderPayload.emptyBottlesReturned || 0,
+    }),
   }).select().single();
 
   if (error) throw error;
 
-  if (orderPayload.items?.length) {
+  if (items.length) {
     const { error: itemsError } = await supabase.from('order_items').insert(
-      orderPayload.items.map((item) => ({
+      items.map((item) => ({
         order_id: order.id,
         // product IDs like "1.5L" are not UUIDs — send null to avoid postgres type error
-        product_id: UUID_RE.test(item.productId || '') ? item.productId : null,
+        product_id: item.catalogProduct.dbId,
+        product_code: item.catalogProduct.code || item.productId,
         quantity: item.quantity,
         subtotal: item.subtotal,
-        used_credits: item.usedCredits || 0,
+        used_credits: item.usedCredits,
       }))
     );
 
     if (itemsError) {
-      console.warn('Could not sync order items for order', order.id, itemsError.message);
+      await supabase.from('orders').delete().eq('id', order.id);
+      throw itemsError;
     }
   }
 
-  return order;
+  const balanceUpdate = {
+    bottle_credits: balances.bottleCredits - usedCreditsTotal,
+    wallet_balance: normalizedPaymentMethod === 'wallet'
+      ? Number((balances.walletBalance - expectedTotal).toFixed(2))
+      : balances.walletBalance,
+    loyalty_points: balances.loyaltyPoints + earnedLoyaltyPoints,
+  };
+
+  let balanceQuery = supabase
+    .from('users')
+    .update(balanceUpdate)
+    .eq('id', userId);
+
+  if (usedCreditsTotal > 0) {
+    balanceQuery = balanceQuery.gte('bottle_credits', usedCreditsTotal);
+  }
+  if (normalizedPaymentMethod === 'wallet' && expectedTotal > 0) {
+    balanceQuery = balanceQuery.gte('wallet_balance', expectedTotal);
+  }
+
+  const { data: updatedBalances, error: balanceError } = await balanceQuery
+    .select('wallet_balance, bottle_credits, loyalty_points')
+    .single();
+
+  if (balanceError) {
+    await supabase.from('orders').delete().eq('id', order.id);
+    throw validationError('Insufficient wallet balance or 5-gallon coupons. Please refresh and try again.');
+  }
+
+  return {
+    ...order,
+    balances: {
+      walletBalance: Number(updatedBalances?.wallet_balance || 0),
+      bottleCredits: Number(updatedBalances?.bottle_credits || 0),
+      loyaltyPoints: Number(updatedBalances?.loyalty_points || 0),
+    },
+    earnedLoyaltyPoints,
+  };
 }
 
-app.use(cors());
-app.use(express.json());
+function parseAllowedOrigins() {
+  const configured = (process.env.FRONTEND_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+
+  if (configured.length) return configured;
+  if (IS_PRODUCTION) return [];
+
+  return [
+    'http://localhost:3000',
+    'http://localhost:5000',
+    'http://localhost:8081',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:5000',
+    'http://127.0.0.1:8081',
+  ];
+}
+
+const ALLOWED_ORIGINS = parseAllowedOrigins();
+
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  if (IS_PRODUCTION) {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
+
+const rateLimitBuckets = new Map();
+
+function createRateLimiter({ windowMs, max, keyPrefix }) {
+  return (req, res, next) => {
+    const now = Date.now();
+    const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    const ip = forwarded || req.ip || req.socket?.remoteAddress || 'unknown';
+    const key = `${keyPrefix}:${ip}`;
+    const entry = rateLimitBuckets.get(key);
+
+    if (!entry || entry.resetAt <= now) {
+      rateLimitBuckets.set(key, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+
+    entry.count += 1;
+    if (entry.count > max) {
+      res.setHeader('Retry-After', String(Math.ceil((entry.resetAt - now) / 1000)));
+      return res.status(429).json({ error: 'Too many requests. Please try again shortly.' });
+    }
+
+    return next();
+  };
+}
+
+const generalRateLimit = createRateLimiter({ windowMs: 60_000, max: 300, keyPrefix: 'general' });
+const sensitiveRateLimit = createRateLimiter({ windowMs: 60_000, max: 30, keyPrefix: 'sensitive' });
+const paymentRateLimit = createRateLimiter({ windowMs: 60_000, max: 20, keyPrefix: 'payment' });
+
+app.use(generalRateLimit);
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+
+    if (!IS_PRODUCTION && /^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error('CORS origin not allowed'));
+  },
+  credentials: true,
+}));
+app.use(express.json({ limit: '8mb' }));
 
 // --- Health Check ---
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', app: 'RS Water API', version: '2.0.0' });
+  res.json({
+    status: 'ok',
+    service: 'rswater-api',
+    environment: NODE_ENV,
+  });
 });
 
 // --- Products ---
 app.get('/api/products', async (req, res) => {
   try {
-    const products = await prisma.product.findMany({ orderBy: { price: 'asc' } });
-    res.json(products);
+    res.json(await loadCatalogProducts());
   } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch products' });
+    logError('Products list error', error);
+    res.status(500).json({ error: 'Could not load products' });
+  }
+});
+
+app.post('/api/pricing/quote', sensitiveRateLimit, async (req, res) => {
+  try {
+    const items = await validateOrderItems(req.body?.items || []);
+    const pricing = calculateOrderPricing(items);
+    res.json({
+      ...pricing,
+      items: items.map((item) => ({
+        productId: item.productId,
+        quantity: item.quantity,
+        unitPrice: item.catalogProduct.price,
+        subtotal: item.subtotal,
+        couponsApplied: item.usedCredits,
+        lineTotal: Number((item.subtotal - (item.usedCredits * item.catalogProduct.price)).toFixed(2)),
+      })),
+    });
+  } catch (error) {
+    logError('Pricing quote error', error);
+    res.status(400).json({ error: getPublicErrorMessage(error, 'Could not calculate pricing') });
+  }
+});
+
+app.get('/api/coupon-packs', async (_req, res) => {
+  try {
+    res.json(await loadCouponPacks());
+  } catch (error) {
+    logError('Coupon packs list error', error);
+    if (isSchemaSetupError(error)) {
+      return res.status(503).json({ error: 'Coupon packs database setup is required' });
+    }
+    res.status(500).json({ error: 'Could not load coupon packs' });
   }
 });
 
 // --- Auth / User ---
-app.post('/api/auth/register', async (req, res) => {
-  const { email, password, name, phone } = req.body;
-  const normalizedEmail = email?.trim().toLowerCase();
-  const normalizedName = name?.trim();
-  const normalizedPhone = phone?.trim();
-
-  if (!normalizedEmail || !password || !normalizedName || !normalizedPhone) {
-    return res.status(400).json({ error: 'Name, email, phone and password are required' });
-  }
-
-  if (password.length < 6) {
-    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+app.post('/api/auth/otp/request', sensitiveRateLimit, async (req, res) => {
+  const phone = normalizeUaePhone(req.body?.phone);
+  if (!/^\+9715\d{8}$/.test(phone)) {
+    return res.status(400).json({ error: 'Valid UAE mobile number required' });
   }
 
   try {
-    let user = await findAuthUserByEmail(normalizedEmail);
+    await ensurePhoneAuthUser(phone, 'CUSTOMER');
+    const { error } = await supabase.auth.signInWithOtp({
+      phone,
+      options: {
+        shouldCreateUser: true,
+        data: { phone, role: 'CUSTOMER' },
+      },
+    });
 
-    if (user) {
-      const { data, error } = await supabase.auth.admin.updateUserById(user.id, {
-        password,
-        email_confirm: true,
-        user_metadata: { ...user.user_metadata, name: normalizedName, phone: normalizedPhone },
-      });
+    if (error) {
+      logError('OTP provider request failed', error);
+      return res.status(400).json({ error: getPublicErrorMessage(error, 'Could not send OTP') });
+    }
+    res.json({ phone, message: 'OTP sent' });
+  } catch (error) {
+    logError('OTP request error', error);
+    res.status(500).json({ error: 'Could not send OTP' });
+  }
+});
 
-      if (error) {
-        return res.status(400).json({ error: error.message });
-      }
+app.post('/api/auth/otp/verify', sensitiveRateLimit, async (req, res) => {
+  const phone = normalizeUaePhone(req.body?.phone);
+  const token = String(req.body?.token || '').trim();
 
-      user = data.user;
-    } else {
-      const { data, error } = await supabase.auth.admin.createUser({
-        email: normalizedEmail,
-        password,
-        email_confirm: true,
-        user_metadata: { name: normalizedName, phone: normalizedPhone },
-      });
+  if (!/^\+9715\d{8}$/.test(phone)) return res.status(400).json({ error: 'Valid UAE mobile number required' });
+  if (!/^\d{6}$/.test(token)) return res.status(400).json({ error: 'Valid 6-digit OTP required' });
 
-      if (error) {
-        return res.status(400).json({ error: error.message });
-      }
-
-      user = data?.user || null;
+  try {
+    const { data, error } = await supabase.auth.verifyOtp({ phone, token, type: 'sms' });
+    if (error || !data?.session || !data?.user) {
+      return res.status(401).json({ error: getPublicErrorMessage(error, 'Invalid or expired OTP') });
     }
 
-    if (!user) {
-      return res.status(500).json({ error: 'User was not created' });
-    }
-
+    const profileEmail = data.user.email || phoneProfileEmail(phone);
+    const profileName = data.user.user_metadata?.name || 'New Customer';
     const { error: profileError } = await supabase.from('users').upsert({
-      id: user.id,
-      email: normalizedEmail,
+      id: data.user.id,
+      email: profileEmail,
       role: 'CUSTOMER',
-      name: normalizedName,
+      name: profileName,
+      updated_at: new Date().toISOString(),
     }, { onConflict: 'id' });
 
     if (profileError) {
-      console.warn('Could not create public.users profile during registration:', profileError.message);
+      logError('OTP profile upsert failed', profileError);
+      return res.status(500).json({ error: 'Could not prepare customer profile' });
     }
 
-    res.status(201).json({
+    res.json({
       user: {
-        id: user.id,
-        email: user.email,
+        id: data.user.id,
+        phone,
+        name: profileName,
+        isProfileComplete: profileName !== 'New Customer',
       },
-      message: 'Account created successfully',
+      session: {
+        accessToken: data.session.access_token,
+        refreshToken: data.session.refresh_token,
+        expiresAt: data.session.expires_at,
+      },
     });
   } catch (error) {
-    console.error('Register error:', error);
-    res.status(500).json({ error: 'Registration failed' });
+    logError('OTP verify error', error);
+    res.status(500).json({ error: 'Could not verify OTP' });
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
-  const { phone } = req.body;
-  if (!phone) return res.status(400).json({ error: 'Phone required' });
+app.post('/api/auth/refresh', sensitiveRateLimit, async (req, res) => {
+  const refreshToken = String(req.body?.refreshToken || '').trim();
+  if (!refreshToken) return res.status(400).json({ error: 'Refresh token required' });
 
   try {
-    let user = await prisma.user.findUnique({ where: { phone } });
-    if (!user) {
-      user = await prisma.user.create({
-        data: { phone, role: 'CUSTOMER', name: 'New User' }
-      });
+    const { data, error } = await supabase.auth.refreshSession({ refresh_token: refreshToken });
+    if (error || !data.session) {
+      return res.status(401).json({ error: getPublicErrorMessage(error, 'Session expired') });
     }
-    res.json({ user, token: `mock-jwt-${user.id}` });
+
+    res.json({
+      accessToken: data.session.access_token,
+      refreshToken: data.session.refresh_token,
+      expiresAt: data.session.expires_at,
+    });
   } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ error: 'Login failed' });
+    logError('Token refresh error', error);
+    res.status(401).json({ error: 'Session expired' });
   }
 });
 
-app.post('/api/orders', async (req, res) => {
-  const { userId, amount, orderPayload, paymentMethod } = req.body;
+app.get('/api/auth/me', requireCustomerAuth, async (req, res) => {
+  try {
+    const { data: profile, error } = await supabase
+      .from('users')
+      .select('id, name')
+      .eq('id', req.authUser.id)
+      .single();
 
-  if (!userId || !amount || !orderPayload?.address || !orderPayload?.items?.length) {
-    return res.status(400).json({ error: 'Missing order details' });
+    if (error) throw error;
+
+    res.json({
+      id: req.authUser.id,
+      phone: req.authUser.phone || req.authUser.user_metadata?.phone || '',
+      name: profile?.name || req.authUser.user_metadata?.name || undefined,
+    });
+  } catch (error) {
+    logError('Session profile error', error);
+    res.status(500).json({ error: 'Could not load session' });
+  }
+});
+
+app.post('/api/driver/auth/login', sensitiveRateLimit, async (req, res) => {
+  const username = String(req.body?.username || '').trim();
+  const password = String(req.body?.password || '');
+
+  if (!DRIVER_LOGIN_USERNAME || !DRIVER_LOGIN_PASSWORD || !DRIVER_SESSION_SECRET) {
+    return res.status(503).json({ error: 'Driver username login is not configured' });
+  }
+  const driver = CONFIGURED_DRIVERS.find((candidate) => safeCompare(candidate.username, username));
+  if (!username || !password || !driver || !safeCompare(DRIVER_LOGIN_PASSWORD, password)) {
+    return res.status(401).json({ error: 'Invalid username or password' });
+  }
+
+  driverShiftStates.set(driver.id, {
+    status: 'ON_DUTY',
+    startedAt: new Date().toISOString(),
+    endedAt: null,
+  });
+  driverGpsSharingStates.set(driver.id, true);
+
+  return res.json({
+    driver: { id: driver.id, phone: '', name: driver.name },
+    session: { accessToken: createConfiguredDriverToken(driver) },
+  });
+});
+
+app.post('/api/driver/auth/otp/request', sensitiveRateLimit, async (req, res) => {
+  res.status(410).json({ error: 'Driver SMS login is disabled. Use username and password.' });
+});
+
+app.post('/api/driver/auth/otp/verify', sensitiveRateLimit, async (req, res) => {
+  res.status(410).json({ error: 'Driver SMS login is disabled. Use username and password.' });
+});
+
+app.get('/api/driver/reverse-geocode', sensitiveRateLimit, requireDriverAuth, async (req, res) => {
+  const latitude = Number(req.query.lat);
+  const longitude = Number(req.query.lng);
+  try {
+    assertUaeCoordinates(latitude, longitude);
+    res.json(await reverseGeocodeUae(latitude, longitude));
+  } catch (error) {
+    logError('Driver reverse geocode error', error);
+    res.status(error.isValidationError ? 400 : 502).json({ error: getPublicErrorMessage(error, 'Could not resolve this GPS location') });
+  }
+});
+
+app.get('/api/driver/customer-requests', requireDriverAuth, async (req, res) => {
+  try {
+    res.json(await driverCustomerRequests.list({ driverId: req.authUser.id }));
+  } catch (error) {
+    logError('Driver customer request list error', error);
+    res.status(500).json({ error: 'Could not load customer requests' });
+  }
+});
+
+app.post('/api/driver/customer-requests', sensitiveRateLimit, requireDriverAuth, async (req, res) => {
+  try {
+    const customerName = truncateText(req.body?.customerName, 100);
+    const phone = normalizeUaePhone(req.body?.phone);
+    const email = truncateText(req.body?.email, 160).toLowerCase();
+    const notes = truncateText(req.body?.notes, 500);
+    const address = truncateText(req.body?.address, 500);
+    const latitude = Number(req.body?.latitude);
+    const longitude = Number(req.body?.longitude);
+    const accuracy = Number(req.body?.accuracy);
+    if (customerName.length < 2) throw validationError('Enter the customer name');
+    if (!/^\+9715\d{8}$/.test(phone)) throw validationError('Enter a valid UAE mobile number');
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw validationError('Enter a valid email address');
+    assertUaeCoordinates(latitude, longitude);
+    if (!address) throw validationError('Capture and confirm the customer address');
+
+    const geocoded = await reverseGeocodeUae(latitude, longitude).catch(() => ({
+      address: `${latitude.toFixed(6)}, ${longitude.toFixed(6)}`,
+      city: '',
+    }));
+    const request = await driverCustomerRequests.submit({
+      driverId: req.authUser.id,
+      driverName: req.driverProfile?.name || req.authUser.user_metadata?.name || 'Driver',
+      customerName,
+      phone,
+      email,
+      notes,
+      latitude,
+      longitude,
+      accuracy: Number.isFinite(accuracy) && accuracy >= 0 ? Math.min(accuracy, 5000) : null,
+      address,
+      capturedAddress: geocoded.address,
+      city: geocoded.city,
+    });
+
+    fireAndForgetNotification(async () => {
+      const { data: admins } = await supabase.from('users').select('id').in('role', [...ADMIN_ROLES]);
+      if (admins?.length) await sendPushToUsers(admins.map((admin) => admin.id), {
+        title: 'New customer approval request',
+        body: `${request.driverName} submitted ${request.customerName} for dispatcher review.`,
+        data: { type: 'driver_customer_request', requestId: request.id },
+      }, 'admin');
+    });
+    res.status(201).json(request);
+  } catch (error) {
+    logError('Driver customer request submission error', error);
+    res.status(error.statusCode || (error.isValidationError ? 400 : 500)).json({ error: getPublicErrorMessage(error, 'Could not submit customer for approval') });
+  }
+});
+
+app.get('/api/admin/customer-requests', requireDispatchReadOnly, async (req, res) => {
+  try {
+    const status = req.query.status ? String(req.query.status).toUpperCase() : undefined;
+    res.json(await driverCustomerRequests.list({ status }));
+  } catch (error) {
+    logError('Dispatcher customer request list error', error);
+    res.status(500).json({ error: 'Could not load customer approval requests' });
+  }
+});
+
+app.post('/api/admin/customer-requests/:requestId/decision', sensitiveRateLimit, requireDispatchReadOnly, async (req, res) => {
+  try {
+    const approved = req.body?.decision === 'approve';
+    if (!approved && req.body?.decision !== 'reject') throw validationError('Decision must be approve or reject');
+    const reason = truncateText(req.body?.reason, 500);
+    const reviewedBy = truncateText(req.body?.reviewedBy, 100) || 'Dispatcher';
+    const request = await driverCustomerRequests.decide({
+      id: String(req.params.requestId),
+      approved,
+      reason,
+      reviewedBy,
+      activate: activateDriverCreatedCustomer,
+    });
+    fireAndForgetNotification(() => sendPushToUser(request.driverId, {
+      title: approved ? 'Customer approved' : 'Customer request rejected',
+      body: approved
+        ? `${request.customerName} is now an active customer.`
+        : `${request.customerName} was not approved${reason ? `: ${reason}` : '.'}`,
+      data: { type: 'driver_customer_request_decision', requestId: request.id, status: request.status },
+    }, 'driver'));
+    res.json(request);
+  } catch (error) {
+    logError('Dispatcher customer request decision error', error);
+    res.status(error.statusCode || (error.isValidationError ? 400 : 500)).json({ error: getPublicErrorMessage(error, 'Could not review customer request') });
+  }
+});
+
+app.post('/api/auth/register', sensitiveRateLimit, async (req, res) => {
+  res.status(410).json({ error: 'Use phone OTP registration through /api/auth/otp/request.' });
+});
+
+app.post('/api/auth/login', sensitiveRateLimit, async (req, res) => {
+  res.status(410).json({ error: 'Use /api/auth/otp/request and /api/auth/otp/verify for phone OTP login.' });
+});
+
+app.get('/api/orders', requireCustomerAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('orders')
+      .select('*, items:order_items(*)')
+      .eq('user_id', req.authUser.id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    res.json((data || []).map((order) => ({
+      id: order.id,
+      status: order.status,
+      total: Number(order.total_amount || 0),
+      paymentMethod: order.payment_method,
+      paymentStatus: order.payment_status,
+      address: order.delivery_address,
+      deliverySlot: order.delivery_slot,
+      notes: order.notes,
+      createdAt: order.created_at,
+      items: (order.items || []).map((item) => ({
+        productId: item.product_code || item.product_id,
+        quantity: item.quantity,
+        subtotal: Number(item.subtotal || 0),
+        usedCredits: Number(item.used_credits || 0),
+      })),
+    })));
+  } catch (error) {
+    logError('List orders error', error);
+    res.status(500).json({ error: 'Could not load orders' });
+  }
+});
+
+app.post('/api/orders', sensitiveRateLimit, requireCustomerAuth, async (req, res) => {
+  const { userId: requestedUserId, amount, orderPayload, paymentMethod } = req.body;
+  const userId = requireSameCustomer(req, res, requestedUserId);
+  if (!userId) return;
+  const normalizedOrderPayload = normalizeOrderPayload(orderPayload);
+
+  if (!userId || amount === undefined || amount === null || !normalizedOrderPayload.address || !normalizedOrderPayload.items.length) {
+    return res.status(400).json({
+      error: 'Missing order details',
+      missing: {
+        userId: !userId,
+        amount: amount === undefined || amount === null,
+        address: !normalizedOrderPayload.address,
+        items: !normalizedOrderPayload.items.length,
+      },
+    });
   }
 
   try {
@@ -227,21 +1519,33 @@ app.post('/api/orders', async (req, res) => {
       userId,
       amount,
       paymentMethod: paymentMethod || 'cod',
-      orderPayload,
+      orderPayload: normalizedOrderPayload,
       initialStatus: 'PENDING',
     });
 
+    fireAndForgetNotification(() => sendPushToUser(userId, orderNotificationPayload('PENDING', order.id), 'customer'));
     res.status(201).json({ order });
   } catch (error) {
-    console.error('Create order error:', error);
-    res.status(500).json({ error: 'Failed to create order' });
+    logError('Create order error', error);
+    res.status(400).json({ error: getPublicErrorMessage(error, 'Failed to create order') });
   }
 });
 
 // GET single user (for session refresh / balance sync)
-app.get('/api/users/:id', async (req, res) => {
+app.get('/api/users/:id', requireCustomerAuth, async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) {
+    return res.status(400).json({ error: 'Invalid user id' });
+  }
+  if (!requireSameCustomer(req, res, req.params.id)) return;
+
   try {
-    const user = await prisma.user.findUnique({ where: { id: req.params.id } });
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+
+    if (error) throw error;
     if (!user) return res.status(404).json({ error: 'User not found' });
     res.json(user);
   } catch (error) {
@@ -249,198 +1553,1594 @@ app.get('/api/users/:id', async (req, res) => {
   }
 });
 
-app.put('/api/users/:id', async (req, res) => {
+app.put('/api/users/:id', sensitiveRateLimit, requireCustomerAuth, async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) {
+    return res.status(400).json({ error: 'Invalid user id' });
+  }
+  if (!requireSameCustomer(req, res, req.params.id)) return;
+
   try {
     // Only allow updating safe fields
     const { name, nameAr, address, building, apartment, city, locationLat, locationLng } = req.body;
     const updateData = {};
     if (name !== undefined) updateData.name = name;
-    if (nameAr !== undefined) updateData.nameAr = nameAr;
+    if (nameAr !== undefined) updateData.name_ar = nameAr;
     if (address !== undefined) updateData.address = address;
     if (building !== undefined) updateData.building = building;
     if (apartment !== undefined) updateData.apartment = apartment;
     if (city !== undefined) updateData.city = city;
-    if (locationLat !== undefined) updateData.locationLat = locationLat;
-    if (locationLng !== undefined) updateData.locationLng = locationLng;
+    if (locationLat !== undefined) updateData.location_lat = locationLat;
+    if (locationLng !== undefined) updateData.location_lng = locationLng;
+    updateData.updated_at = new Date().toISOString();
 
-    const user = await prisma.user.update({
-      where: { id: req.params.id },
-      data: updateData
-    });
+    const { data: user, error } = await supabase
+      .from('users')
+      .update(updateData)
+      .eq('id', req.params.id)
+      .select()
+      .single();
+
+    if (error) throw error;
     res.json(user);
   } catch (error) {
     res.status(500).json({ error: 'Failed to update user' });
   }
 });
 
-// --- Wallet & Credits ---
-app.post('/api/users/:id/wallet/topup', async (req, res) => {
-  const { amount } = req.body;
-  if (!amount || amount <= 0) return res.status(400).json({ error: 'Invalid amount' });
+app.delete('/api/users/:id', sensitiveRateLimit, requireCustomerAuth, async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) {
+    return res.status(400).json({ error: 'Invalid user id' });
+  }
+  if (!requireSameCustomer(req, res, req.params.id)) return;
+
   try {
-    const user = await prisma.user.update({
-      where: { id: req.params.id },
-      data: { walletBalance: { increment: Number(amount) } }
+    await supabase.from('users').delete().eq('id', req.params.id);
+    const { error } = await supabase.auth.admin.deleteUser(req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    logError('Delete account error', error);
+    res.status(500).json({ error: 'Failed to delete account' });
+  }
+});
+
+app.get('/api/subscriptions', requireCustomerAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('subscriptions')
+      .select('*')
+      .eq('user_id', req.authUser.id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    logError('List subscriptions error', error);
+    res.status(500).json({ error: 'Could not load subscriptions' });
+  }
+});
+
+app.post('/api/subscriptions', sensitiveRateLimit, requireCustomerAuth, async (req, res) => {
+  const productId = String(req.body?.productId || '').trim();
+  const quantity = Number(req.body?.quantity || 1);
+  const frequency = String(req.body?.frequency || 'weekly').trim().toLowerCase();
+  const deliveryAddress = String(req.body?.deliveryAddress || '').trim();
+
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > 20) return res.status(400).json({ error: 'Invalid quantity' });
+  if (!['weekly', 'biweekly', 'monthly'].includes(frequency)) return res.status(400).json({ error: 'Invalid frequency' });
+  if (!deliveryAddress) return res.status(400).json({ error: 'Delivery address is required' });
+
+  try {
+    const catalog = await getProductCatalogMap();
+    const catalogProduct = catalog.get(productId);
+    if (!catalogProduct) return res.status(400).json({ error: 'Invalid product' });
+
+    const nextDeliveryDate = new Date();
+    nextDeliveryDate.setDate(nextDeliveryDate.getDate() + (frequency === 'monthly' ? 30 : frequency === 'biweekly' ? 14 : 7));
+
+    const { data, error } = await supabase
+      .from('subscriptions')
+      .insert({
+        user_id: req.authUser.id,
+        product_code: catalogProduct.code || catalogProduct.id,
+        quantity,
+        frequency,
+        status: 'ACTIVE',
+        next_delivery_date: nextDeliveryDate.toISOString().slice(0, 10),
+        delivery_address: deliveryAddress,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (error) {
+    logError('Create subscription error', error);
+    res.status(500).json({ error: 'Could not create subscription' });
+  }
+});
+
+app.get('/api/driver/routes/today', requireDriverAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('orders')
+      .select('*, user:users(name, phone), items:order_items(*)')
+      .eq('assigned_driver_id', req.authUser.id)
+      .in('status', ['PENDING', 'OUT_FOR_DELIVERY'])
+      .order('created_at', { ascending: true });
+
+    if (error && error.code !== '42703') throw error;
+
+    const databaseRoute = (data || []).map((order, index) => ({
+      id: order.id,
+      orderId: order.id,
+      orderNumber: order.id,
+      customerName: order.user?.name || 'Customer',
+      address: order.delivery_address || '',
+      latitude: Number.isFinite(Number(order.latitude)) ? Number(order.latitude) : null,
+      longitude: Number.isFinite(Number(order.longitude)) ? Number(order.longitude) : null,
+      routeSequence: index + 1,
+      status: 'ASSIGNED',
+      cashDue: order.payment_method === 'cod' ? Number(order.total_amount || 0) : 0,
+      totalAmount: Number(order.total_amount || 0),
+      paymentMethod: String(order.payment_method || '').toUpperCase(),
+      paymentStatus: String(order.payment_status || '').toUpperCase(),
+      deliverySlot: order.delivery_slot || '',
+      deliveryInstructions: parseStoredOrderNotes(order.notes).deliveryInstructions || '',
+      items: (order.items || []).map((item) => ({
+        id: item.id,
+        productId: item.product_code || item.product_id || '',
+        name: item.product_code || item.product_id || 'Order item',
+        quantity: Number(item.quantity || 0),
+        unitPrice: Number(item.quantity || 0) > 0 ? Number((Number(item.subtotal || 0) / Number(item.quantity)).toFixed(2)) : 0,
+        subtotal: Number(item.subtotal || 0),
+        usedCredits: Number(item.used_credits || 0),
+      })),
+      source: 'operations',
+    }));
+    const plannedRoute = await getConfiguredDriverRoute(req.authUser.id);
+    const combinedByOrder = new Map();
+
+    plannedRoute.forEach((stop) => combinedByOrder.set(String(stop.orderId || stop.id), stop));
+    databaseRoute.forEach((stop) => {
+      const orderKey = String(stop.orderId || stop.id);
+      combinedByOrder.set(orderKey, { ...combinedByOrder.get(orderKey), ...stop });
     });
+
+    const combinedStops = [...combinedByOrder.values()];
+    const routableStops = combinedStops.filter((stop) => (
+      Number.isFinite(Number(stop.latitude)) && Number.isFinite(Number(stop.longitude))
+    ));
+    const unroutableStops = combinedStops.filter((stop) => (
+      !Number.isFinite(Number(stop.latitude)) || !Number.isFinite(Number(stop.longitude))
+    ));
+    const currentLocation = latestDriverLocations.get(req.authUser.id);
+    const optimizedStops = optimizeStopOrder(
+      routableStops.map((stop) => ({
+        ...stop,
+        latitude: Number(stop.latitude),
+        longitude: Number(stop.longitude),
+      })),
+      currentLocation
+        ? { latitude: Number(currentLocation.lat), longitude: Number(currentLocation.lng) }
+        : null,
+    );
+
+    const responseStops = [...optimizedStops, ...unroutableStops].map((stop, index) => ({
+      ...stop,
+      routeSequence: index + 1,
+      assignmentToken: createDeliveryAssignmentToken({
+        orderId: String(stop.orderId || stop.id),
+        driverId: req.authUser.id,
+        source: stop.source || 'operations',
+      }),
+    }));
+    await driverReports.recordAssignments(
+      { id: req.authUser.id, name: req.driverProfile?.name || req.authUser.user_metadata?.name || 'Driver' },
+      responseStops,
+    );
+    return res.json(responseStops);
+  } catch (error) {
+    logError('Driver route list error', error);
+    res.status(500).json({ error: 'Could not load driver route' });
+  }
+});
+
+app.get('/api/driver/shift', requireDriverAuth, (req, res) => {
+  res.json(getDriverShiftState(req.authUser.id));
+});
+
+app.post('/api/driver/shift/start', sensitiveRateLimit, requireDriverAuth, (req, res) => {
+  const shift = {
+    status: 'ON_DUTY',
+    startedAt: new Date().toISOString(),
+    endedAt: null,
+  };
+  driverShiftStates.set(req.authUser.id, shift);
+  driverGpsSharingStates.set(req.authUser.id, false);
+  res.json(shift);
+});
+
+app.post('/api/driver/shift/end', sensitiveRateLimit, requireDriverAuth, async (req, res) => {
+  const previous = getDriverShiftState(req.authUser.id);
+  const endedAt = previous.status === 'OFF_DUTY' && previous.endedAt
+    ? previous.endedAt
+    : new Date().toISOString();
+  const shift = {
+    status: 'OFF_DUTY',
+    startedAt: previous.startedAt,
+    endedAt,
+  };
+
+  driverShiftStates.set(req.authUser.id, shift);
+  driverGpsSharingStates.set(req.authUser.id, false);
+  latestDriverLocations.delete(req.authUser.id);
+
+  let dayReport = null;
+  try {
+    dayReport = await driverReports.generateReport({
+      id: req.authUser.id,
+      name: req.driverProfile?.name || req.authUser.user_metadata?.name || 'Driver',
+    });
+  } catch (error) {
+    if (error?.statusCode !== 409) logError('End-shift report generation error', error);
+  }
+
+  res.json({ ...shift, dayReport });
+});
+
+app.post('/api/driver/location/start', sensitiveRateLimit, requireDriverAuth, (req, res) => {
+  if (getDriverShiftState(req.authUser.id).status === 'OFF_DUTY') {
+    return res.status(409).json({ error: 'Start a shift before sharing GPS.', code: 'SHIFT_ENDED' });
+  }
+  driverGpsSharingStates.set(req.authUser.id, true);
+  res.json({ sharing: true });
+});
+
+app.post('/api/driver/location/stop', sensitiveRateLimit, requireDriverAuth, (req, res) => {
+  driverGpsSharingStates.set(req.authUser.id, false);
+  latestDriverLocations.delete(req.authUser.id);
+  res.json({ sharing: false });
+});
+
+app.post('/api/driver/location', sensitiveRateLimit, requireDriverAuth, async (req, res) => {
+  const lat = Number(req.body?.lat);
+  const lng = Number(req.body?.lng);
+  const accuracy = Number(req.body?.accuracy);
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return res.status(400).json({ error: 'Valid coordinates required' });
+
+  if (getDriverShiftState(req.authUser.id).status === 'OFF_DUTY') {
+    return res.status(409).json({
+      error: 'This shift has ended. Start a new shift before sharing GPS.',
+      code: 'SHIFT_ENDED',
+    });
+  }
+  if (driverGpsSharingStates.get(req.authUser.id) === false) {
+    return res.status(409).json({
+      error: 'GPS sharing is stopped. Enable it before sending a location.',
+      code: 'GPS_SHARING_STOPPED',
+    });
+  }
+
+  try {
+    latestDriverLocations.set(req.authUser.id, {
+      driver_id: req.authUser.id,
+      lat,
+      lng,
+      accuracy: Number.isFinite(accuracy) ? accuracy : null,
+      recorded_at: req.body?.recordedAt || new Date().toISOString(),
+    });
+    await driverReports.recordLocation(
+      { id: req.authUser.id, name: req.driverProfile?.name || req.authUser.user_metadata?.name || 'Driver' },
+      latestDriverLocations.get(req.authUser.id),
+    );
+    res.status(201).json({ ok: true });
+  } catch (error) {
+    logError('Driver location error', error);
+    res.status(500).json({ error: 'Could not record driver location' });
+  }
+});
+
+async function finishDriverDayRecord(req, stop, completion) {
+  const driver = {
+    id: req.authUser.id,
+    name: req.driverProfile?.name || req.authUser.user_metadata?.name || 'Driver',
+  };
+  await driverReports.recordCompletion(driver, stop, completion);
+
+  const [plannedRoute, assignedOrders] = await Promise.all([
+    getConfiguredDriverRoute(req.authUser.id).catch(() => []),
+    supabase.from('orders')
+      .select('id', { count: 'exact', head: true })
+      .eq('assigned_driver_id', req.authUser.id)
+      .in('status', ['PENDING', 'OUT_FOR_DELIVERY']),
+  ]);
+  const remainingAssigned = assignedOrders.error ? 1 : Number(assignedOrders.count || 0);
+  if (plannedRoute.length || remainingAssigned) return null;
+
+  try {
+    return await driverReports.generateReport(driver, driverReports.dateKey(new Date(completion.completedAt)));
+  } catch (error) {
+    logError('Automatic driver report generation failed', error);
+    return null;
+  }
+}
+
+app.post('/api/driver/deliveries/:orderId/complete', sensitiveRateLimit, requireDriverAuth, async (req, res) => {
+  const orderId = String(req.params.orderId || '').trim();
+  if (!/^[A-Za-z0-9._:-]{6,80}$/.test(orderId)) return res.status(400).json({ error: 'Invalid order id' });
+
+  const emptyBottlesReturned = Number(req.body?.emptyBottlesReturned || 0);
+  const cashCollected = Number(req.body?.cashCollected || 0);
+  if (!Number.isInteger(emptyBottlesReturned) || emptyBottlesReturned < 0 || emptyBottlesReturned > 999) {
+    return res.status(400).json({ error: 'Invalid empty bottle count' });
+  }
+  if (!Number.isFinite(cashCollected) || cashCollected < 0 || cashCollected > 100000) {
+    return res.status(400).json({ error: 'Invalid cash amount' });
+  }
+
+  const assignment = verifyDeliveryAssignmentToken(req.body?.assignmentToken, {
+    orderId,
+    driverId: req.authUser.id,
+  });
+  if (!assignment || !['operations', 'website'].includes(assignment.source)) {
+    return res.status(403).json({ error: 'This delivery is not assigned to the signed-in driver' });
+  }
+
+  let storedProof;
+  try {
+    const routeSnapshot = await getConfiguredDriverRoute(req.authUser.id).catch(() => []);
+    const assignedStop = routeSnapshot.find((stop) => String(stop.orderId || stop.id) === orderId) || {
+      id: orderId,
+      orderId,
+      orderNumber: orderId,
+      customerName: 'Customer',
+      address: 'Address not recorded',
+      source: assignment.source,
+    };
+    if (assignment.source === 'website') {
+      storedProof = await uploadDeliveryProof({
+        orderId,
+        driverId: req.authUser.id,
+        proofPhoto: req.body?.proofPhoto,
+      });
+      const completedAt = new Date().toISOString();
+      const headers = {
+        'content-type': 'application/json',
+        'user-agent': 'delivery-driver-operations/1.0',
+      };
+      if (WEBSITE_DISPATCH_WRITE_KEY) headers['x-dispatch-write-key'] = WEBSITE_DISPATCH_WRITE_KEY;
+      const websiteResponse = await fetch(`${WEBSITE_DISPATCH_WRITE_BASE_URL}/orders/${encodeURIComponent(orderId)}/complete`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          driverId: req.authUser.id,
+          completedAt,
+          proof: storedProof,
+          emptyBottlesReturned,
+          cashCollected,
+        }),
+      });
+      const websiteResult = await websiteResponse.json().catch(() => ({}));
+      if (!websiteResponse.ok) throw validationError(websiteResult.error || 'Could not complete website delivery');
+      if (websiteResult.alreadyCompleted) {
+        await supabase.storage.from(storedProof.bucket).remove([storedProof.path]);
+        storedProof = null;
+      }
+      const resolvedCompletedAt = websiteResult.completedAt || completedAt;
+      const dayReport = await finishDriverDayRecord(req, assignedStop, {
+        completedAt: resolvedCompletedAt,
+        status: websiteResult.status || 'DELIVERED',
+        emptyBottlesReturned,
+        cashCollected,
+      });
+      return res.json({
+        ...websiteResult,
+        completedAt: resolvedCompletedAt,
+        proofStored: !websiteResult.alreadyCompleted,
+        dayReport,
+      });
+    }
+
+    const { data: currentOrder, error: lookupError } = await supabase
+      .from('orders')
+      .select('id, status, total_amount, payment_method, payment_status, notes')
+      .eq('id', orderId)
+      .single();
+    if (lookupError || !currentOrder) return res.status(404).json({ error: 'Order not found' });
+    if (!['PENDING', 'OUT_FOR_DELIVERY'].includes(String(currentOrder.status || '').toUpperCase())) {
+      return res.status(409).json({ error: `Order is already ${String(currentOrder.status || 'closed').toLowerCase()}` });
+    }
+
+    const totalDue = Number(currentOrder.total_amount || 0);
+    if (String(currentOrder.payment_method || '').toLowerCase() === 'cod' && cashCollected + 0.01 < totalDue) {
+      return res.status(400).json({ error: `Cash collected must cover the AED ${totalDue.toFixed(2)} amount due` });
+    }
+
+    storedProof = await uploadDeliveryProof({
+      orderId,
+      driverId: req.authUser.id,
+      proofPhoto: req.body?.proofPhoto,
+    });
+    const completedAt = new Date().toISOString();
+    const existingNotes = parseStoredOrderNotes(currentOrder.notes);
+    const updateData = {
+      status: 'DELIVERED',
+      notes: JSON.stringify({
+        ...existingNotes,
+        deliveryProof: {
+          bucket: storedProof.bucket,
+          path: storedProof.path,
+          mimeType: storedProof.mimeType,
+          size: storedProof.size,
+          driverId: req.authUser.id,
+          capturedAt: completedAt,
+        },
+        emptyBottlesReturned,
+        cashCollected,
+        completedAt,
+      }),
+    };
+    if (String(currentOrder.payment_method || '').toLowerCase() === 'cod' && cashCollected >= totalDue) updateData.payment_status = 'PAID';
+
+    const { data, error } = await supabase
+      .from('orders')
+      .update(updateData)
+      .eq('id', orderId)
+      .in('status', ['PENDING', 'OUT_FOR_DELIVERY'])
+      .select()
+      .single();
+
+    if (error) throw error;
+    fireAndForgetNotification(() => sendPushToUser(data.user_id, orderNotificationPayload('DELIVERED', data.id), 'customer'));
+    const dayReport = await finishDriverDayRecord(req, assignedStop, {
+      completedAt,
+      status: data.status,
+      note: existingNotes.deliveryInstructions || '',
+      emptyBottlesReturned,
+      cashCollected,
+    });
+    res.json({
+      id: data.id,
+      status: data.status,
+      paymentStatus: data.payment_status,
+      completedAt,
+      proofStored: true,
+      dayReport,
+    });
+  } catch (error) {
+    if (storedProof?.path) {
+      await supabase.storage.from(storedProof.bucket).remove([storedProof.path]).catch(() => {});
+    }
+    logError('Driver completion error', error);
+    res.status(error?.isValidationError ? 400 : 500).json({ error: getPublicErrorMessage(error, 'Could not complete delivery') });
+  }
+});
+
+app.get('/api/driver/reports', requireDriverAuth, async (req, res) => {
+  try {
+    res.json(await driverReports.listReports(req.authUser.id));
+  } catch (error) {
+    logError('Driver report list error', error);
+    res.status(500).json({ error: 'Could not load driver reports' });
+  }
+});
+
+app.post('/api/driver/reports/end-day', sensitiveRateLimit, requireDriverAuth, async (req, res) => {
+  try {
+    const report = await driverReports.generateReport({
+      id: req.authUser.id,
+      name: req.driverProfile?.name || req.authUser.user_metadata?.name || 'Driver',
+    }, req.body?.date ? String(req.body.date) : undefined);
+    res.status(201).json(report);
+  } catch (error) {
+    logError('Driver report generation error', error);
+    res.status(error.statusCode || 500).json({ error: getPublicErrorMessage(error, 'Could not generate end-of-day report') });
+  }
+});
+
+app.get('/api/driver/reports/:reportId/download', async (req, res) => {
+  const reportId = String(req.params.reportId || '');
+  if (!driverReports.verifyDownload(reportId, req.query.expires, req.query.signature)) {
+    return res.status(403).json({ error: 'This report download link is invalid or has expired' });
+  }
+  try {
+    const report = await driverReports.downloadReport(reportId);
+    if (!report) return res.status(404).json({ error: 'Report not found' });
+    const safeName = `driver-eod-${report.metadata.driverName}-${report.metadata.date}`.replace(/[^A-Za-z0-9._-]+/g, '-');
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Length', report.bytes.length);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}.pdf"`);
+    return res.send(report.bytes);
+  } catch (error) {
+    logError('Driver report download error', error);
+    return res.status(500).json({ error: 'Could not download report' });
+  }
+});
+
+app.get('/api/admin/driver-reports', requireDispatchReadOnly, async (_req, res) => {
+  try {
+    res.json(await driverReports.listReports());
+  } catch (error) {
+    logError('Admin driver report list error', error);
+    res.status(500).json({ error: 'Could not load driver reports' });
+  }
+});
+
+app.patch('/api/subscriptions/:id', sensitiveRateLimit, requireCustomerAuth, async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) return res.status(400).json({ error: 'Invalid subscription id' });
+
+  const updates = {};
+  if (req.body?.status !== undefined) {
+    const status = String(req.body.status).toUpperCase();
+    if (!['ACTIVE', 'PAUSED', 'SKIPPED', 'CANCELLED'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
+    updates.status = status;
+  }
+  if (req.body?.frequency !== undefined) {
+    const frequency = String(req.body.frequency).toLowerCase();
+    if (!['weekly', 'biweekly', 'monthly'].includes(frequency)) return res.status(400).json({ error: 'Invalid frequency' });
+    updates.frequency = frequency;
+  }
+  if (req.body?.quantity !== undefined) {
+    const quantity = Number(req.body.quantity);
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 20) return res.status(400).json({ error: 'Invalid quantity' });
+    updates.quantity = quantity;
+  }
+  updates.updated_at = new Date().toISOString();
+
+  try {
+    const { data, error } = await supabase
+      .from('subscriptions')
+      .update(updates)
+      .eq('id', req.params.id)
+      .eq('user_id', req.authUser.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    logError('Update subscription error', error);
+    res.status(500).json({ error: 'Could not update subscription' });
+  }
+});
+
+// --- Wallet & Credits ---
+app.post('/api/users/:id/wallet/topup', paymentRateLimit, requireCustomerAuth, async (req, res) => {
+  if (IS_PRODUCTION) {
+    return res.status(501).json({ error: 'Direct wallet top-up is disabled in production. Use the payment gateway flow.' });
+  }
+
+  const { amount } = req.body;
+  const safeAmount = Number(amount);
+  if (!UUID_RE.test(req.params.id)) return res.status(400).json({ error: 'Invalid user id' });
+  if (!requireSameCustomer(req, res, req.params.id)) return;
+  if (!Number.isFinite(safeAmount) || safeAmount <= 0) return res.status(400).json({ error: 'Invalid amount' });
+
+  try {
+    const balances = await getCustomerBalances(req.params.id);
+    const { data: user, error } = await supabase
+      .from('users')
+      .update({ wallet_balance: Number((balances.walletBalance + safeAmount).toFixed(2)) })
+      .eq('id', req.params.id)
+      .select()
+      .single();
+
+    if (error) throw error;
     res.json(user);
   } catch (error) {
     res.status(500).json({ error: 'Top up failed' });
   }
 });
 
-// Buy 5-gallon credit pack (280 AED = 20 credits)
-app.post('/api/users/:id/wallet/buy-credits', async (req, res) => {
-  try {
-    const user = await prisma.user.findUnique({ where: { id: req.params.id } });
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    if (user.walletBalance < 280) return res.status(400).json({ error: 'Insufficient wallet balance. Need 280 AED.' });
+// Buy 5-gallon coupon pack from wallet balance. Internal DB field remains bottle_credits for compatibility.
+app.post('/api/users/:id/wallet/buy-credits', paymentRateLimit, requireCustomerAuth, async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) return res.status(400).json({ error: 'Invalid user id' });
+  if (!requireSameCustomer(req, res, req.params.id)) return;
 
-    const updated = await prisma.user.update({
-      where: { id: req.params.id },
-      data: {
-        walletBalance: { decrement: 280 },
-        bottleCredits: { increment: 20 }
-      }
-    });
-    res.json(updated);
+  const { packId } = req.body;
+
+  try {
+    const pack = await getCouponPack(packId);
+    if (!pack) return res.status(400).json({ error: 'Invalid coupon pack' });
+
+    const balances = await getCustomerBalances(req.params.id);
+    if (balances.walletBalance < pack.price) {
+      return res.status(400).json({ error: `Insufficient wallet balance. Need ${pack.price} AED.` });
+    }
+
+    const totalCoupons = pack.totalCoupons;
+    const { data: updated, error } = await supabase
+      .from('users')
+      .update({
+        wallet_balance: Number((balances.walletBalance - pack.price).toFixed(2)),
+        bottle_credits: balances.bottleCredits + totalCoupons,
+      })
+      .eq('id', req.params.id)
+      .gte('wallet_balance', pack.price)
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(400).json({ error: 'Insufficient wallet balance or customer balance changed. Please refresh and try again.' });
+    }
+    fireAndForgetNotification(() => sendPushToUser(req.params.id, {
+      title: 'Alrawdah Springs',
+      body: 'Your 5-gallon coupons have been added.',
+      data: { type: 'coupon', packId, totalCoupons },
+    }, 'customer'));
+    res.json({ user: updated, pack: { ...pack, totalCoupons } });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to buy credits' });
+    res.status(500).json({ error: 'Failed to buy coupon pack' });
   }
 });
 
-// --- Payment redirect relay endpoints ---
-// N-Genius only accepts http/https redirect URLs, so we relay back to the app scheme from here.
-const BASE_URL = process.env.BASE_URL || 'https://mobile-app-production-5491.up.railway.app';
+// --- Push Notifications ---
+app.post('/api/notifications/register-token', sensitiveRateLimit, async (req, res) => {
+  const token = String(req.body?.token || '').trim();
+  const platform = normalizePushPlatform(req.body?.platform);
+  const appType = normalizeAppType(req.body?.appType);
+  const deviceName = truncateText(req.body?.deviceName, 120);
+  const deviceId = truncateText(req.body?.deviceId, 120);
+  const bearerToken = getBearerToken(req);
+  let userId = null;
+
+  if (!isExpoPushToken(token)) {
+    return res.status(400).json({ error: 'Invalid Expo push token' });
+  }
+
+  try {
+    if (bearerToken) {
+      const { data, error } = await supabase.auth.getUser(bearerToken);
+      if (error || !data?.user?.id) return res.status(401).json({ error: 'Invalid or expired session' });
+      const { data: profile, error: profileError } = await supabase
+        .from('users')
+        .select('role')
+        .eq('id', data.user.id)
+        .single();
+      if (profileError || !profile) return res.status(403).json({ error: 'Profile role required for push registration' });
+      if (appType === 'customer' && profile.role !== 'CUSTOMER') return res.status(403).json({ error: 'Customer role required' });
+      if (appType === 'driver' && profile.role !== 'DRIVER') return res.status(403).json({ error: 'Driver role required' });
+      if (appType === 'admin' && !ADMIN_ROLES.has(profile.role)) return res.status(403).json({ error: 'Admin role required' });
+      userId = data.user.id;
+    } else {
+      const apiKey = req.get('x-api-key') || req.get('authorization')?.replace(/^Bearer\s+/i, '');
+      const isDriverKey = DRIVER_API_KEY && apiKey && safeCompare(DRIVER_API_KEY, apiKey);
+      const isAdminKey = ADMIN_API_KEY && apiKey && safeCompare(ADMIN_API_KEY, apiKey);
+      if (!isDriverKey && !isAdminKey) return res.status(401).json({ error: 'Authentication required' });
+      if (appType === 'driver' && UUID_RE.test(String(req.body?.userId || ''))) userId = req.body.userId;
+      if (appType === 'admin' && UUID_RE.test(String(req.body?.userId || ''))) userId = req.body.userId;
+    }
+
+    const { error } = await supabase.from('push_tokens').upsert({
+      user_id: userId,
+      token,
+      platform,
+      app_type: appType,
+      device_id: deviceId || null,
+      device_name: deviceName || null,
+      is_active: true,
+      last_used_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'token' });
+
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    logError('Register push token error', error);
+    res.status(500).json({ error: 'Could not register push token' });
+  }
+});
+
+app.post('/api/notifications/unregister-token', sensitiveRateLimit, async (req, res) => {
+  const token = String(req.body?.token || '').trim();
+  const bearerToken = getBearerToken(req);
+
+  if (!isExpoPushToken(token)) return res.status(400).json({ error: 'Invalid Expo push token' });
+
+  try {
+    if (bearerToken) {
+      const { data, error: authError } = await supabase.auth.getUser(bearerToken);
+      if (authError || !data?.user?.id) return res.status(401).json({ error: 'Invalid or expired session' });
+      const { error } = await supabase
+        .from('push_tokens')
+        .update({ is_active: false, updated_at: new Date().toISOString() })
+        .eq('token', token)
+        .eq('user_id', data.user.id);
+      if (error) throw error;
+      return res.json({ success: true });
+    }
+
+    const apiKey = req.get('x-api-key') || req.get('authorization')?.replace(/^Bearer\s+/i, '');
+    const isOperationsKey = (DRIVER_API_KEY && apiKey && safeCompare(DRIVER_API_KEY, apiKey)) || (ADMIN_API_KEY && apiKey && safeCompare(ADMIN_API_KEY, apiKey));
+    if (!isOperationsKey) return res.status(401).json({ error: 'Authentication required' });
+    const { error } = await supabase
+      .from('push_tokens')
+      .update({ is_active: false, updated_at: new Date().toISOString() })
+      .eq('token', token);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    logError('Unregister push token error', error);
+    res.status(500).json({ error: 'Could not unregister push token' });
+  }
+});
+
+app.get('/api/notifications/history', requireCustomerAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('notification_recipients')
+      .select('status, error, created_at, notification:notification_logs(title, body, audience, data, created_at)')
+      .eq('user_id', req.authUser.id)
+      .order('created_at', { ascending: false })
+      .limit(50);
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch notification history' });
+  }
+});
+
+app.post('/api/admin/notifications/send', requireAdmin, async (req, res) => {
+  const title = truncateText(req.body?.title, 100);
+  const body = truncateText(req.body?.body, 220);
+  const audience = String(req.body?.audience || 'all');
+  const userIds = Array.isArray(req.body?.userIds) ? req.body.userIds : [];
+  const data = req.body?.data && typeof req.body.data === 'object' ? req.body.data : {};
+  const image = typeof req.body?.image === 'string' ? req.body.image.trim() : '';
+
+  if (!title || !body) return res.status(400).json({ error: 'Title and message are required' });
+  if (!ALLOWED_NOTIFICATION_AUDIENCES.has(audience)) return res.status(400).json({ error: 'Invalid audience' });
+  if (audience === 'specificUsers' && !userIds.length) return res.status(400).json({ error: 'Select at least one user' });
+
+  try {
+    const { data: log, error: logErrorResult } = await supabase.from('notification_logs').insert({
+      title,
+      body,
+      audience,
+      data,
+      sent_count: 0,
+      failed_count: 0,
+    }).select().single();
+    if (logErrorResult) throw logErrorResult;
+
+    const result = await sendPushToAudience(audience, { title, body, data, image }, userIds, log.id);
+    await supabase.from('notification_logs').update({
+      sent_count: result.sentCount,
+      failed_count: result.failedCount,
+    }).eq('id', log.id);
+
+    res.json({ success: true, sentCount: result.sentCount, failedCount: result.failedCount });
+  } catch (error) {
+    logError('Admin notification send error', error);
+    res.status(500).json({ error: 'Failed to send notification' });
+  }
+});
+
+app.get('/api/admin/notifications/history', requireAdmin, async (_req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('notification_logs')
+      .select('id, title, body, audience, data, sent_count, failed_count, created_at')
+      .order('created_at', { ascending: false })
+      .limit(50);
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch notification history' });
+  }
+});
 
 app.get('/api/payment/complete', (req, res) => {
-  const params = new URLSearchParams(req.query).toString();
-  res.redirect(`customerapp://payment-complete${params ? '?' + params : ''}`);
+  res.redirect(buildRedirectUrl(PAYMENT_COMPLETE_REDIRECT_URL, req.query));
 });
 
 app.get('/api/payment/cancel', (_req, res) => {
-  res.redirect('customerapp://payment-cancel');
+  res.redirect(PAYMENT_CANCEL_REDIRECT_URL);
 });
 
 app.get('/api/payment/checkout-complete', (req, res) => {
-  const params = new URLSearchParams(req.query).toString();
-  res.redirect(`customerapp://checkout-complete${params ? '?' + params : ''}`);
+  res.redirect(buildRedirectUrl(CHECKOUT_COMPLETE_REDIRECT_URL, req.query));
 });
 
-// --- Network International (N-Genius) Payment Gateway ---
-app.post('/api/payment/ngenius/topup', async (req, res) => {
-  const { amount, userId } = req.body;
+async function createPaymentTransaction({ reference, type, userId, amount, payload = {} }) {
+  const safeAmount = Number(amount);
+  const { data, error } = await supabase
+    .from('payment_transactions')
+    .insert({
+      reference,
+      type,
+      user_id: userId,
+      amount: safeAmount,
+      currency: 'AED',
+      status: 'PENDING',
+      payload,
+    })
+    .select()
+    .single();
 
-  if (!amount || !userId) {
+  if (error) {
+    logError('Payment ledger insert failed', error);
+    throw validationError('Payment ledger is not configured. Please contact support.');
+  }
+
+  return data;
+}
+
+async function getPaymentTransaction(reference) {
+  const { data, error } = await supabase
+    .from('payment_transactions')
+    .select('*')
+    .eq('reference', reference)
+    .single();
+
+  if (error) {
+    logError('Payment ledger lookup failed', error);
+    throw validationError('Payment reference was not found. Please restart payment.');
+  }
+
+  return data;
+}
+
+function assertPaymentTransactionMatches(transaction, { type, userId, amount }) {
+  if (transaction.type !== type || transaction.user_id !== userId) {
+    throw validationError('Payment reference does not match this customer.');
+  }
+
+  const ledgerAmount = Number(transaction.amount || 0);
+  if (Math.abs(ledgerAmount - Number(amount)) > 0.01) {
+    throw validationError('Payment amount mismatch');
+  }
+}
+
+function chunkArray(items, size) {
+  const chunks = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+async function deactivatePushTokens(tokens = []) {
+  const uniqueTokens = [...new Set(tokens.filter(Boolean))];
+  if (!uniqueTokens.length) return;
+
+  const { error } = await supabase
+    .from('push_tokens')
+    .update({ is_active: false, updated_at: new Date().toISOString() })
+    .in('token', uniqueTokens);
+
+  if (error) logError('Could not deactivate invalid push tokens', error);
+}
+
+async function fetchActivePushTokensForUsers(userIds = [], appType = null) {
+  const cleanIds = [...new Set(userIds.filter((id) => UUID_RE.test(String(id || ''))))];
+  if (!cleanIds.length) return [];
+
+  let query = supabase
+    .from('push_tokens')
+    .select('token, user_id, app_type')
+    .eq('is_active', true)
+    .in('user_id', cleanIds);
+
+  if (appType) query = query.eq('app_type', appType);
+
+  const { data, error } = await query;
+  if (error) throw error;
+  return data || [];
+}
+
+async function fetchActivePushTokensForAudience(audience, userIds = []) {
+  let query = supabase
+    .from('push_tokens')
+    .select('token, user_id, app_type')
+    .eq('is_active', true);
+
+  if (audience === 'customers') query = query.eq('app_type', 'customer');
+  if (audience === 'drivers') query = query.eq('app_type', 'driver');
+  if (audience === 'specificUsers') {
+    const cleanIds = [...new Set(userIds.filter((id) => UUID_RE.test(String(id || ''))))];
+    if (!cleanIds.length) return [];
+    query = query.in('user_id', cleanIds);
+  }
+
+  const { data, error } = await query;
+  if (error) throw error;
+  return data || [];
+}
+
+async function sendPushToTokens(tokenRows, payload, logId = null) {
+  const rows = (tokenRows || []).filter((row) => isExpoPushToken(row.token));
+  if (!rows.length) return { sentCount: 0, failedCount: 0 };
+
+  const messages = rows.map((row) => ({
+    to: row.token,
+    sound: 'default',
+    title: truncateText(payload.title, 100),
+    body: truncateText(payload.body, 220),
+    data: payload.data || {},
+    ...(payload.image ? { richContent: { image: payload.image } } : {}),
+  }));
+
+  let sentCount = 0;
+  let failedCount = 0;
+  const invalidTokens = [];
+  const recipientRows = [];
+
+  for (const chunk of chunkArray(messages, 100)) {
+    const response = await fetch(EXPO_PUSH_SEND_URL, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Accept-Encoding': 'gzip, deflate',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(chunk),
+    });
+
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      failedCount += chunk.length;
+      chunk.forEach((message) => {
+        recipientRows.push({
+          notification_log_id: logId,
+          token: message.to,
+          status: 'FAILED',
+          error: `Expo Push API ${response.status}`,
+        });
+      });
+      continue;
+    }
+
+    const tickets = Array.isArray(result.data) ? result.data : [];
+    tickets.forEach((ticket, index) => {
+      const original = rows[messages.indexOf(chunk[index])];
+      if (ticket?.status === 'ok') {
+        sentCount += 1;
+        recipientRows.push({
+          notification_log_id: logId,
+          user_id: original?.user_id || null,
+          token: chunk[index].to,
+          status: 'SENT',
+        });
+      } else {
+        failedCount += 1;
+        const errorCode = ticket?.details?.error || ticket?.message || 'Unknown push error';
+        if (errorCode === 'DeviceNotRegistered') invalidTokens.push(chunk[index].to);
+        recipientRows.push({
+          notification_log_id: logId,
+          user_id: original?.user_id || null,
+          token: chunk[index].to,
+          status: 'FAILED',
+          error: String(errorCode).slice(0, 500),
+        });
+      }
+    });
+
+    const receiptIds = tickets.filter((ticket) => ticket?.id).map((ticket) => ticket.id);
+    if (receiptIds.length) {
+      fetch(EXPO_PUSH_RECEIPTS_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: receiptIds }),
+      })
+        .then((receiptResponse) => receiptResponse.json())
+        .then((receiptResult) => {
+          const receipts = receiptResult?.data || {};
+          const receiptInvalidTokens = [];
+          Object.values(receipts).forEach((receipt) => {
+            if (receipt?.details?.error === 'DeviceNotRegistered') {
+              const ticketIndex = tickets.findIndex((ticket) => ticket.id && receipts[ticket.id] === receipt);
+              if (ticketIndex >= 0 && chunk[ticketIndex]?.to) receiptInvalidTokens.push(chunk[ticketIndex].to);
+            }
+          });
+          return deactivatePushTokens(receiptInvalidTokens);
+        })
+        .catch((error) => logError('Expo push receipt check failed', error));
+    }
+  }
+
+  if (invalidTokens.length) await deactivatePushTokens(invalidTokens);
+  if (recipientRows.length) {
+    const { error } = await supabase.from('notification_recipients').insert(recipientRows);
+    if (error) logError('Could not store notification recipients', error);
+  }
+
+  return { sentCount, failedCount };
+}
+
+async function sendPushToUsers(userIds, payload, appType = null) {
+  const tokens = await fetchActivePushTokensForUsers(userIds, appType);
+  return sendPushToTokens(tokens, payload);
+}
+
+async function sendPushToUser(userId, payload, appType = null) {
+  return sendPushToUsers([userId], payload, appType);
+}
+
+async function sendPushToAudience(audience, payload, userIds = [], logId = null) {
+  const tokens = await fetchActivePushTokensForAudience(audience, userIds);
+  return sendPushToTokens(tokens, payload, logId);
+}
+
+function orderNotificationPayload(status, orderId) {
+  const normalized = String(status || '').toUpperCase();
+  const messages = {
+    PENDING: 'Your order has been confirmed.',
+    OUT_FOR_DELIVERY: 'Your order is out for delivery.',
+    DELIVERED: 'Your order has been delivered. Thank you for choosing Alrawdah Springs.',
+    CANCELLED: 'Your order has been cancelled.',
+  };
+
+  return {
+    title: 'Alrawdah Springs',
+    body: messages[normalized] || 'Your order has been updated.',
+    data: { type: 'order', orderId, status: normalized },
+  };
+}
+
+async function markPaymentTransaction(reference, status, fields = {}) {
+  const { data, error } = await supabase
+    .from('payment_transactions')
+    .update({
+      status,
+      ...fields,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('reference', reference)
+    .select()
+    .single();
+
+  if (error) {
+    logError('Payment ledger update failed', error);
+    throw validationError('Payment ledger could not be updated. Please contact support.');
+  }
+
+  return data;
+}
+
+// --- Network International (N-Genius) Payment Gateway ---
+app.post('/api/payment/ngenius/topup', paymentRateLimit, requireCustomerAuth, async (req, res) => {
+  const { amount, userId: requestedUserId } = req.body;
+  const userId = requireSameCustomer(req, res, requestedUserId);
+  if (!userId) return;
+
+  const safeAmount = Number(amount);
+
+  if (!Number.isFinite(safeAmount) || safeAmount <= 0 || !userId || !UUID_RE.test(userId)) {
     return res.status(400).json({ error: 'Missing amount or userId' });
   }
 
   try {
-    const redirectUrl = `${BASE_URL}/api/payment/complete?amount=${amount}&userId=${userId}`;
-    const orderData = await createNGeniusOrder(amount, redirectUrl);
+    const redirectUrl = buildRedirectUrl(`${PAYMENT_RELAY_BASE_URL}/api/payment/complete`, { amount: safeAmount, userId });
+    const orderData = await createNGeniusOrder(safeAmount, redirectUrl);
+    await createPaymentTransaction({
+      reference: orderData.orderRef,
+      type: 'wallet_topup',
+      userId,
+      amount: safeAmount,
+      payload: { source: 'customer_app' },
+    });
     res.json(orderData);
   } catch (error) {
-    console.error('N-Genius topup error:', error.message);
-    res.status(500).json({ error: 'Payment gateway failed', details: error.message });
+    logError('N-Genius topup error', error);
+    res.status(500).json({ error: 'Payment gateway failed' });
+  }
+});
+
+app.post('/api/payment/ngenius/topup/confirm', paymentRateLimit, requireCustomerAuth, async (req, res) => {
+  const { amount, userId: requestedUserId, orderRef } = req.body;
+  const userId = requireSameCustomer(req, res, requestedUserId);
+  if (!userId) return;
+  const safeAmount = Number(amount);
+
+  if (!Number.isFinite(safeAmount) || safeAmount <= 0 || !userId || !UUID_RE.test(userId) || !orderRef) {
+    return res.status(400).json({ error: 'Missing payment confirmation details' });
+  }
+
+  try {
+    const transaction = await getPaymentTransaction(orderRef);
+    assertPaymentTransactionMatches(transaction, { type: 'wallet_topup', userId, amount: safeAmount });
+
+    if (transaction.status === 'PROCESSED') {
+      const { data: existingUser, error: existingError } = await supabase
+        .from('users')
+        .select('*')
+        .eq('id', userId)
+        .single();
+      if (existingError) throw existingError;
+      return res.json({ user: existingUser, alreadyProcessed: true });
+    }
+    if (transaction.status !== 'PENDING') {
+      return res.status(409).json({ error: 'Payment is already being processed. Please refresh shortly.' });
+    }
+
+    await markPaymentTransaction(orderRef, 'PROCESSING');
+
+    const paymentStatus = await getNGeniusOrderStatus(orderRef);
+    if (!isNGeniusPaymentPaid(paymentStatus)) {
+      await markPaymentTransaction(orderRef, 'FAILED');
+      return res.status(402).json({ error: 'Payment has not been completed' });
+    }
+
+    const gatewayAmount = Number(paymentStatus.amount || 0) / 100;
+    if (gatewayAmount && Math.abs(gatewayAmount - safeAmount) > 0.01) {
+      await markPaymentTransaction(orderRef, 'FAILED');
+      return res.status(400).json({ error: 'Payment amount mismatch' });
+    }
+
+    const balances = await getCustomerBalances(userId);
+    const { data: updated, error } = await supabase
+      .from('users')
+      .update({ wallet_balance: Number((balances.walletBalance + safeAmount).toFixed(2)) })
+      .eq('id', userId)
+      .select()
+      .single();
+
+    if (error) throw error;
+    await markPaymentTransaction(orderRef, 'PROCESSED', { processed_at: new Date().toISOString() });
+    fireAndForgetNotification(() => sendPushToUser(userId, {
+      title: 'Alrawdah Springs',
+      body: 'Your wallet top-up was successful.',
+      data: { type: 'wallet', amount: safeAmount },
+    }, 'customer'));
+    res.json({ user: updated });
+  } catch (error) {
+    if (orderRef) {
+      await markPaymentTransaction(orderRef, 'PENDING').catch(() => undefined);
+    }
+    logError('N-Genius topup confirmation error', error);
+    res.status(400).json({ error: getPublicErrorMessage(error, 'Payment confirmation failed') });
   }
 });
 
 // --- Orders (Backend Admin/Customer fallback) ---
-app.post('/api/payment/ngenius/checkout', async (req, res) => {
-  const { amount, userId, orderPayload } = req.body;
-  if (!amount || !userId) return res.status(400).json({ error: 'Missing data' });
+app.post('/api/payment/ngenius/checkout', paymentRateLimit, requireCustomerAuth, async (req, res) => {
+  const { amount, userId: requestedUserId, orderPayload } = req.body;
+  const userId = requireSameCustomer(req, res, requestedUserId);
+  if (!userId) return;
+  const normalizedOrderPayload = normalizeOrderPayload(orderPayload);
+
+  if (!userId || amount === undefined || amount === null || !normalizedOrderPayload.address || !normalizedOrderPayload.items.length) {
+    return res.status(400).json({
+      error: 'Missing checkout details',
+      missing: {
+        userId: !userId,
+        amount: amount === undefined || amount === null,
+        address: !normalizedOrderPayload.address,
+        items: !normalizedOrderPayload.items.length,
+      },
+    });
+  }
 
   try {
+    await validateCheckoutForPaymentInit({ userId, amount, orderPayload: normalizedOrderPayload });
+    const redirectUrl = buildRedirectUrl(`${PAYMENT_RELAY_BASE_URL}/api/payment/checkout-complete`);
+    const orderData = await createNGeniusOrder(amount, redirectUrl);
+    await createPaymentTransaction({
+      reference: orderData.orderRef,
+      type: 'checkout',
+      userId,
+      amount,
+      payload: { orderPayload: normalizedOrderPayload },
+    });
+    res.json(orderData);
+  } catch (err) {
+    logError('N-Genius checkout error', err);
+    res.status(400).json({ error: getPublicErrorMessage(err, 'Checkout failed') });
+  }
+});
+
+app.post('/api/payment/ngenius/checkout/confirm', paymentRateLimit, requireCustomerAuth, async (req, res) => {
+  const { amount, userId: requestedUserId, orderRef, orderPayload } = req.body;
+  const userId = requireSameCustomer(req, res, requestedUserId);
+  if (!userId) return;
+  const normalizedOrderPayload = normalizeOrderPayload(orderPayload);
+
+  if (!userId || amount === undefined || amount === null || !orderRef || !normalizedOrderPayload.address || !normalizedOrderPayload.items.length) {
+    return res.status(400).json({ error: 'Missing checkout confirmation details' });
+  }
+
+  try {
+    const transaction = await getPaymentTransaction(orderRef);
+    assertPaymentTransactionMatches(transaction, { type: 'checkout', userId, amount });
+
+    if (transaction.status === 'PROCESSED') {
+      const { data: existingOrder, error: existingError } = await supabase
+        .from('orders')
+        .select('*')
+        .eq('id', transaction.order_id)
+        .single();
+      if (existingError) throw existingError;
+      return res.status(200).json({ order: existingOrder, alreadyProcessed: true });
+    }
+    if (transaction.status !== 'PENDING') {
+      return res.status(409).json({ error: 'Payment is already being processed. Please refresh shortly.' });
+    }
+
+    await markPaymentTransaction(orderRef, 'PROCESSING');
+
+    await validateCheckoutForPaymentInit({ userId, amount, orderPayload: normalizedOrderPayload });
+    const paymentStatus = await getNGeniusOrderStatus(orderRef);
+    if (!isNGeniusPaymentPaid(paymentStatus)) {
+      await markPaymentTransaction(orderRef, 'FAILED');
+      return res.status(402).json({ error: 'Payment has not been completed' });
+    }
+
+    const gatewayAmount = Number(paymentStatus.amount || 0) / 100;
+    if (gatewayAmount && Math.abs(gatewayAmount - Number(amount)) > 0.01) {
+      await markPaymentTransaction(orderRef, 'FAILED');
+      return res.status(400).json({ error: 'Payment amount mismatch' });
+    }
+
     const order = await createOrderInSupabase({
       userId,
       amount,
       paymentMethod: 'card',
-      orderPayload,
+      orderPayload: normalizedOrderPayload,
       initialStatus: 'PENDING',
     });
 
-    const encodedOrderId = encodeURIComponent(order.id);
-    const redirectUrl = `${BASE_URL}/api/payment/checkout-complete?orderId=${encodedOrderId}`;
-    const orderData = await createNGeniusOrder(amount, redirectUrl);
-    res.json(orderData);
+    await supabase
+      .from('orders')
+      .update({ payment_status: 'PAID' })
+      .eq('id', order.id);
+
+    await markPaymentTransaction(orderRef, 'PROCESSED', {
+      order_id: order.id,
+      processed_at: new Date().toISOString(),
+    });
+
+    fireAndForgetNotification(async () => {
+      await sendPushToUser(userId, {
+        title: 'Alrawdah Springs',
+        body: 'Your card payment was successful.',
+        data: { type: 'wallet', orderId: order.id },
+      }, 'customer');
+      await sendPushToUser(userId, orderNotificationPayload('PENDING', order.id), 'customer');
+    });
+    res.status(201).json({ order: { ...order, payment_status: 'PAID' } });
   } catch (err) {
-    console.error('N-Genius checkout error:', err.message);
-    res.status(500).json({ error: 'Checkout failed', details: err.message });
+    if (orderRef) {
+      await markPaymentTransaction(orderRef, 'PENDING').catch(() => undefined);
+    }
+    logError('N-Genius checkout confirmation error', err);
+    res.status(400).json({ error: getPublicErrorMessage(err, 'Checkout confirmation failed') });
   }
 });
 
-async function createNGeniusOrder(amount, redirectUrl) {
-  const NI_API_KEY = process.env.NI_API_KEY || 'Yjc3MzM5Y2ItMWEwOC00MWNlLTliYTctNTg0ZGMwOWRiMGIzOjA4ZjgzZDdmLWMyODktNDMyZi04MTZlLTNlYTQ0YjZmYzMzYQ==';
-  const NI_OUTLET_ID = process.env.NI_OUTLET_ID || '6f291f9f-6e76-440f-8feb-01fd43706da1';
-
-  const tokenResp = await fetch("https://api-gateway.ngenius-payments.com/identity/auth/access-token", {
-    method: "POST",
-    headers: {
-      "Authorization": `Basic ${NI_API_KEY}`,
-      "Content-Type": "application/vnd.ni-identity.v1+json",
-      "Accept": "application/vnd.ni-identity.v1+json"
-    }
-  });
-
-  if (!tokenResp.ok) {
-    const body = await tokenResp.text();
-    console.error(`N-Genius auth failed [${tokenResp.status}]:`, body);
-    throw new Error(`N-Genius authentication failed (${tokenResp.status})`);
+async function validateCheckoutForPaymentInit({ userId, amount, orderPayload }) {
+  if (!UUID_RE.test(userId)) {
+    throw validationError('Invalid user id');
   }
 
-  const tokenData = await tokenResp.json();
+  const safeAmount = Number(amount);
+  if (!Number.isFinite(safeAmount) || safeAmount < 0) {
+    throw validationError('Invalid order amount');
+  }
 
-  const orderResp = await fetch(`https://api-gateway.ngenius-payments.com/transactions/outlets/${NI_OUTLET_ID}/orders`, {
+  if (!orderPayload.address) {
+    throw validationError('Delivery address is required');
+  }
+
+  const items = await validateOrderItems(orderPayload.items);
+  const pricing = calculateOrderPricing(items);
+  const expectedTotal = pricing.total;
+
+  if (Math.abs(safeAmount - expectedTotal) > 0.01) {
+    throw validationError(`Invalid order total. Expected ${expectedTotal.toFixed(2)} AED`);
+  }
+}
+
+async function createNGeniusOrder(amount, redirectUrl) {
+  if (!NGENIUS_API_KEY || !NGENIUS_OUTLET_ID) {
+    throw new Error('N-Genius payment credentials are not configured');
+  }
+
+  const accessToken = await createNGeniusAccessToken();
+
+  const orderResp = await fetch(`${NGENIUS_BASE_URL}/transactions/outlets/${NGENIUS_OUTLET_ID}/orders`, {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${tokenData.access_token}`,
+      "Authorization": `Bearer ${accessToken}`,
       "Content-Type": "application/vnd.ni-payment.v2+json",
       "Accept": "application/vnd.ni-payment.v2+json"
     },
     body: JSON.stringify({
       action: "SALE",
       amount: { currencyCode: "AED", value: Math.round(amount * 100) },
-      merchantAttributes: { redirectUrl, cancelUrl: `${BASE_URL}/api/payment/cancel`, skipConfirmationPage: true },
+      merchantAttributes: { redirectUrl, cancelUrl: `${PAYMENT_RELAY_BASE_URL}/api/payment/cancel`, skipConfirmationPage: true },
       paymentMethods: ["CARD"]
     })
   });
 
   if (!orderResp.ok) {
-    const body = await orderResp.text();
-    console.error(`N-Genius order creation failed [${orderResp.status}]:`, body);
-    throw new Error(`N-Genius order creation failed (${orderResp.status}): ${body}`);
+    logError('N-Genius order creation failed', { status: orderResp.status, message: await orderResp.text() });
+    throw new Error(`N-Genius order creation failed (${orderResp.status})`);
   }
 
   const orderData = await orderResp.json();
 
   if (!orderData._links?.payment?.href) {
-    console.error('N-Genius response missing payment URL:', JSON.stringify(orderData));
+    logError('N-Genius response missing payment URL', { message: 'Missing payment href' });
     throw new Error('N-Genius did not return a payment URL');
   }
 
   return { paymentUrl: orderData._links.payment.href, orderRef: orderData.reference };
 }
 
-// --- Admin Endpoints ---
-app.get('/api/admin/metrics', async (req, res) => {
+async function createNGeniusAccessToken() {
+  const tokenResp = await fetch(`${NGENIUS_BASE_URL}/identity/auth/access-token`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Basic ${NGENIUS_API_KEY}`,
+      "Content-Type": "application/vnd.ni-identity.v1+json",
+      "Accept": "application/vnd.ni-identity.v1+json"
+    }
+  });
+
+  if (!tokenResp.ok) {
+    logError('N-Genius auth failed', { status: tokenResp.status, message: await tokenResp.text() });
+    throw new Error(`N-Genius authentication failed (${tokenResp.status})`);
+  }
+
+  const tokenData = await tokenResp.json();
+  return tokenData.access_token;
+}
+
+async function getNGeniusOrderStatus(orderRef) {
+  if (!NGENIUS_API_KEY || !NGENIUS_OUTLET_ID) {
+    throw new Error('N-Genius payment credentials are not configured');
+  }
+
+  const accessToken = await createNGeniusAccessToken();
+  const statusResp = await fetch(`${NGENIUS_BASE_URL}/transactions/outlets/${NGENIUS_OUTLET_ID}/orders/${encodeURIComponent(orderRef)}`, {
+    method: "GET",
+    headers: {
+      "Authorization": `Bearer ${accessToken}`,
+      "Accept": "application/vnd.ni-payment.v2+json"
+    }
+  });
+
+  if (!statusResp.ok) {
+    logError('N-Genius status check failed', { status: statusResp.status, message: await statusResp.text() });
+    throw new Error(`N-Genius status check failed (${statusResp.status})`);
+  }
+
+  const orderData = await statusResp.json();
+  const payment = orderData._embedded?.payment?.[0] || {};
+  const amount = payment.amount?.value || orderData.amount?.value || 0;
+
+  return {
+    orderState: orderData._embedded?.payment?.[0]?.state || orderData.state,
+    paymentState: payment.state,
+    amount,
+  };
+}
+
+function isNGeniusPaymentPaid(paymentStatus) {
+  const states = [paymentStatus.orderState, paymentStatus.paymentState]
+    .filter(Boolean)
+    .map((state) => String(state).toUpperCase());
+  return states.some((state) => ['CAPTURED', 'PURCHASED', 'AUTHORISED', 'AUTHORIZED', 'SUCCESS'].includes(state));
+}
+
+// --- Admin: Drivers ---
+app.get('/api/admin/dispatch/overview', requireDispatchReadOnly, async (req, res) => {
   try {
-    const [ordersCount, totalRevenueAgg, customersCount, damagedCount] = await Promise.all([
-      prisma.order.count(),
-      prisma.order.aggregate({ _sum: { totalAmount: true } }),
-      prisma.user.count({ where: { role: 'CUSTOMER' } }),
-      prisma.delivery.aggregate({ _sum: { bottlesDamaged: true } })
+    const [authUsers, driversResult, ordersResult, customersResult] = await Promise.all([
+      listAllAuthUsers(),
+      supabase
+        .from('users')
+        .select('id, name, email, address, building, apartment, city, location_lat, location_lng')
+        .eq('role', 'DRIVER')
+        .order('name'),
+      supabase
+        .from('orders')
+        .select('*, user:users(name, email, address, building, apartment, city, location_lat, location_lng)')
+        .in('status', ['PENDING', 'OUT_FOR_DELIVERY'])
+        .order('created_at', { ascending: true }),
+      supabase
+        .from('users')
+        .select('id, name, email, address, building, apartment, city, location_lat, location_lng, created_at')
+        .eq('role', 'CUSTOMER')
+        .order('created_at', { ascending: false }),
     ]);
+
+    if (driversResult.error) throw driversResult.error;
+    if (ordersResult.error) throw ordersResult.error;
+    if (customersResult.error) throw customersResult.error;
+
+    const palette = ['#6656d9', '#0c9f8f', '#df6c20', '#2779bd', '#b92b62', '#008ca8', '#6f42d9'];
+    const authById = new Map(authUsers.map((user) => [user.id, user]));
+    const authByEmail = new Map(authUsers.filter((user) => user.email).map((user) => [user.email.toLowerCase(), user]));
+
+    const activeOrders = ordersResult.data || [];
+    const driverRecords = [...(driversResult.data || [])];
+    for (const configuredDriver of CONFIGURED_DRIVERS) {
+      if (DRIVER_LOGIN_USERNAME && !driverRecords.some((driver) => driver.id === configuredDriver.id)) {
+        driverRecords.push({
+          id: configuredDriver.id,
+          name: configuredDriver.name,
+          email: null,
+          address: null,
+          building: null,
+          apartment: null,
+          city: 'UAE',
+          location_lat: null,
+          location_lng: null,
+        });
+      }
+    }
+    const driverById = new Map(driverRecords.map((driver, index) => [driver.id, { ...driver, color: palette[index % palette.length] }]));
+    const activeStopsByDriver = new Map();
+    for (const order of activeOrders) {
+      if (order.assigned_driver_id) {
+        activeStopsByDriver.set(order.assigned_driver_id, (activeStopsByDriver.get(order.assigned_driver_id) || 0) + 1);
+      }
+    }
+
+    const drivers = driverRecords.map((driver, index) => {
+      const authUser = authById.get(driver.id) || (driver.email ? authByEmail.get(driver.email.toLowerCase()) : null);
+      const location = latestDriverLocations.get(driver.id);
+      const shift = getDriverShiftState(driver.id);
+      const latitude = Number(location?.lat);
+      const longitude = Number(location?.lng);
+      return {
+        id: driver.id,
+        name: driver.name || driver.email || 'Driver',
+        phone: authUser?.phone || authUser?.user_metadata?.phone || '',
+        zoneName: driver.city || '',
+        color: palette[index % palette.length],
+        activeStops: activeStopsByDriver.get(driver.id) || 0,
+        homeLatitude: driver.location_lat != null && Number.isFinite(Number(driver.location_lat)) ? Number(driver.location_lat) : null,
+        homeLongitude: driver.location_lng != null && Number.isFinite(Number(driver.location_lng)) ? Number(driver.location_lng) : null,
+        shiftStatus: shift.status,
+        gpsSharing: driverGpsSharingStates.get(driver.id) !== false && Boolean(location),
+        location: Number.isFinite(latitude) && Number.isFinite(longitude) ? {
+          latitude,
+          longitude,
+          accuracy: Number.isFinite(Number(location.accuracy)) ? Number(location.accuracy) : null,
+          recordedAt: location.recorded_at,
+        } : null,
+      };
+    });
+
+    const sequenceByDriver = new Map();
+    const orders = activeOrders.map((order) => {
+      const driver = order.assigned_driver_id ? driverById.get(order.assigned_driver_id) : null;
+      const customer = order.user || {};
+      const customerAuth = customer.email ? authByEmail.get(customer.email.toLowerCase()) : null;
+      const latitude = Number(order.latitude ?? customer.location_lat);
+      const longitude = Number(order.longitude ?? customer.location_lng);
+      const nextSequence = order.assigned_driver_id
+        ? (sequenceByDriver.get(order.assigned_driver_id) || 0) + 1
+        : null;
+      if (order.assigned_driver_id) sequenceByDriver.set(order.assigned_driver_id, nextSequence);
+
+      return {
+        id: order.id,
+        orderNumber: order.id,
+        total: Number(order.total_amount || 0),
+        createdAt: order.created_at,
+        customerName: customer.name || 'Customer',
+        customerPhone: customerAuth?.phone || customerAuth?.user_metadata?.phone || '',
+        address: order.delivery_address || buildAddressDisplay(customer),
+        area: customer.city || '',
+        latitude: Number.isFinite(latitude) ? latitude : null,
+        longitude: Number.isFinite(longitude) ? longitude : null,
+        assignedDriverId: order.assigned_driver_id || null,
+        driverName: driver?.name || driver?.email || null,
+        driverColor: driver?.color || null,
+        zoneName: driver?.city || customer.city || null,
+        routeSequence: nextSequence,
+        routeExcluded: false,
+      };
+    });
+
+    const customers = (customersResult.data || []).map((customer) => {
+      const authUser = authById.get(customer.id) || (customer.email ? authByEmail.get(customer.email.toLowerCase()) : null);
+      const latitude = Number(customer.location_lat);
+      const longitude = Number(customer.location_lng);
+      const customerOrders = activeOrders.filter((order) => order.user_id === customer.id);
+      return {
+        id: customer.id,
+        name: customer.name || customer.email || 'Customer',
+        phone: authUser?.phone || authUser?.user_metadata?.phone || '',
+        address: buildAddressDisplay(customer),
+        area: customer.city || '',
+        latitude: Number.isFinite(latitude) ? latitude : null,
+        longitude: Number.isFinite(longitude) ? longitude : null,
+        lastOrderAt: customerOrders.at(-1)?.created_at || null,
+        source: 'operations',
+      };
+    });
+
+    res.json({ generatedAt: new Date().toISOString(), drivers, orders, customers });
+  } catch (error) {
+    logError('Read-only dispatch overview failed', error);
+    res.status(500).json({ error: 'Could not load dispatch overview' });
+  }
+});
+
+app.get('/api/admin/drivers', requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('id, name, email')
+      .eq('role', 'DRIVER')
+      .order('name');
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch drivers' });
+  }
+});
+
+app.post('/api/admin/orders/:id/assign', requireAdmin, async (req, res) => {
+  const { driverId } = req.body;
+  if (!driverId) return res.status(400).json({ error: 'driverId required' });
+
+  try {
+    const { data, error } = await supabase
+      .from('orders')
+      .update({ assigned_driver_id: driverId, status: 'OUT_FOR_DELIVERY' })
+      .eq('id', req.params.id)
+      .select()
+      .single();
+    if (error) throw error;
+    fireAndForgetNotification(async () => {
+      await sendPushToUser(data.user_id, orderNotificationPayload('OUT_FOR_DELIVERY', data.id), 'customer');
+      await sendPushToUser(driverId, {
+        title: 'New delivery assigned',
+        body: 'A new delivery has been assigned to you.',
+        data: { type: 'delivery', orderId: data.id, deliveryId: data.id },
+      }, 'driver');
+    });
+    res.json(data);
+  } catch (error) {
+    logError('Assign driver error', error);
+    res.status(500).json({ error: 'Failed to assign driver' });
+  }
+});
+
+// --- Admin Endpoints ---
+app.get('/api/admin/metrics', requireAdmin, async (req, res) => {
+  try {
+    const [ordersResult, customersResult, deliveriesResult] = await Promise.all([
+      supabase.from('orders').select('total_amount, status', { count: 'exact' }),
+      supabase.from('users').select('id', { count: 'exact', head: true }).eq('role', 'CUSTOMER'),
+      supabase.from('deliveries').select('bottles_damaged'),
+    ]);
+
+    if (ordersResult.error) throw ordersResult.error;
+    if (customersResult.error) throw customersResult.error;
+    if (deliveriesResult.error && deliveriesResult.error.code !== '42P01') throw deliveriesResult.error;
+
+    const orders = ordersResult.data || [];
+    const revenue = orders.reduce((sum, order) => (
+      (order.status || '').toUpperCase() === 'CANCELLED'
+        ? sum
+        : sum + Number(order.total_amount || 0)
+    ), 0);
+    const damaged = (deliveriesResult.data || []).reduce((sum, delivery) => (
+      sum + Number(delivery.bottles_damaged || 0)
+    ), 0);
+
     res.json({
-      revenue: totalRevenueAgg._sum.totalAmount || 0,
-      deliveries: ordersCount,
-      customers: customersCount,
-      damaged: damagedCount._sum.bottlesDamaged || 0
+      revenue,
+      deliveries: ordersResult.count || orders.length,
+      customers: customersResult.count || 0,
+      damaged,
     });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch metrics' });
   }
 });
 
-app.get('/api/admin/orders', async (req, res) => {
+app.get('/api/admin/orders', requireOperationsAccess, async (req, res) => {
   try {
     const [authUsersResult, ordersResult] = await Promise.all([
       listAllAuthUsers(),
@@ -457,7 +3157,16 @@ app.get('/api/admin/orders', async (req, res) => {
         .map((user) => [user.email.toLowerCase(), user.user_metadata?.phone || user.phone || ''])
     );
 
-    const orders = (ordersResult.data || []).map((order) => ({
+    const catalog = await getProductCatalogMap();
+    const orders = (ordersResult.data || []).map((order) => {
+      let notes = {};
+      try {
+        notes = order.notes ? JSON.parse(order.notes) : {};
+      } catch {
+        notes = { deliveryInstructions: order.notes || '' };
+      }
+
+      return {
       id: order.id,
       createdAt: order.created_at,
       totalAmount: order.total_amount,
@@ -466,6 +3175,8 @@ app.get('/api/admin/orders', async (req, res) => {
       paymentStatus: order.payment_status || 'UNPAID',
       deliveryAddress: order.delivery_address,
       deliverySlot: order.delivery_slot,
+      deliveryInstructions: notes.deliveryInstructions || '',
+      emptyBottlesReturned: Number(notes.emptyBottlesReturned || 0),
       user: order.user ? {
         id: order.user.id,
         name: order.user.name,
@@ -475,17 +3186,37 @@ app.get('/api/admin/orders', async (req, res) => {
         locationLat: order.user.location_lat,
         locationLng: order.user.location_lng,
       } : null,
-      items: order.items || [],
-    }));
+      assigned_driver_id: order.assigned_driver_id || null,
+      items: (order.items || []).map((item) => {
+        const productId = item.product_code || item.product_id || '';
+        const catalogProduct = catalog.get(String(productId));
+        const quantity = Number(item.quantity || 0);
+        const subtotal = Number(item.subtotal || 0);
+
+        return {
+          id: item.id,
+          order_id: item.order_id,
+          product_id: productId,
+          productCode: productId,
+          productName: catalogProduct?.name || productId || 'Unknown product',
+          productCategory: catalogProduct?.category || '',
+          unitPrice: quantity > 0 ? Number((subtotal / quantity).toFixed(2)) : Number(catalogProduct?.price || 0),
+          quantity,
+          subtotal,
+          usedCredits: Number(item.used_credits || 0),
+        };
+      }),
+    };
+    });
 
     res.json(orders);
   } catch (error) {
-    console.error('Failed to fetch admin orders:', error);
+    logError('Failed to fetch admin orders', error);
     res.status(500).json({ error: 'Failed to fetch admin orders' });
   }
 });
 
-app.put('/api/admin/orders/:id/status', async (req, res) => {
+app.put('/api/admin/orders/:id/status', requireOperationsAccess, async (req, res) => {
   const { status } = req.body;
   // Normalize status to uppercase for backend consistency
   const normalizedStatus = status ? status.toUpperCase() : 'PENDING';
@@ -499,6 +3230,9 @@ app.put('/api/admin/orders/:id/status', async (req, res) => {
     'OUT_FOR_DELIVERY': 'OUT_FOR_DELIVERY',
   };
   const dbStatus = STATUS_MAP[normalizedStatus] || normalizedStatus;
+  if (!ALLOWED_ORDER_STATUSES.has(dbStatus)) {
+    return res.status(400).json({ error: 'Invalid order status' });
+  }
 
   try {
     const { data: order, error } = await supabase.from('orders')
@@ -509,15 +3243,16 @@ app.put('/api/admin/orders/:id/status', async (req, res) => {
 
     if (error) throw error;
 
+    fireAndForgetNotification(() => sendPushToUser(order.user_id, orderNotificationPayload(dbStatus, order.id), 'customer'));
     res.json(order);
   } catch (error) {
-    console.error('Failed to update order status:', error);
+    logError('Failed to update order status', error);
     res.status(500).json({ error: 'Failed to update order status' });
   }
 });
 
 // Admin: Get all customers
-app.get('/api/admin/customers', async (req, res) => {
+app.get('/api/admin/customers', requireAdmin, async (req, res) => {
   try {
     const [authUsers, usersResult, ordersResult] = await Promise.all([
       listAllAuthUsers(),
@@ -572,14 +3307,22 @@ app.get('/api/admin/customers', async (req, res) => {
 
     res.json(customers);
   } catch (error) {
-    console.error('Failed to fetch customers:', error);
+    logError('Failed to fetch customers', error);
     res.status(500).json({ error: 'Failed to fetch customers' });
   }
 });
 
+app.use((err, _req, res, _next) => {
+  if (err?.message === 'CORS origin not allowed') {
+    return res.status(403).json({ error: 'CORS origin not allowed' });
+  }
+
+  logError('Unhandled API error', err);
+  return res.status(500).json({ error: 'Internal server error' });
+});
 const PORT = process.env.PORT || 5000;
 const HOST = process.env.HOST || '0.0.0.0';
 
 app.listen(PORT, HOST, () => {
-  console.log(`✅ RS Water Backend API is running on http://localhost:${PORT}`);
+  console.log(`RS Water Backend API listening on ${HOST}:${PORT} (${NODE_ENV})`);
 });
