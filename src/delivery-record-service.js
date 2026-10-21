@@ -18,6 +18,8 @@ const MAX_FAILURE_NOTE_LENGTH = 500;
 const MAX_AMOUNT = 100000;
 const AMOUNT_TOLERANCE = 0.01;
 const DUBAI_UTC_OFFSET = '+04:00';
+const MAX_IDEMPOTENCY_KEY_LENGTH = 100;
+const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9._:-]+$/;
 
 function invalid(message, code) {
   return { error: message, code };
@@ -32,6 +34,32 @@ function isMissingFunctionError(error) {
   const code = String(error.code || '');
   if (code === '42883' || code === 'PGRST202') return true;
   return /could not find the function/i.test(String(error.message || ''));
+}
+
+function isMissingColumnError(error, column) {
+  if (!error) return false;
+  const code = String(error.code || '');
+  const message = String(error.message || '');
+  if (column && !message.includes(column)) return false;
+  if (code === '42703' || code === 'PGRST204') return true;
+  return /column .* does not exist/i.test(message) || /could not find the .* column/i.test(message);
+}
+
+function isUniqueViolationError(error) {
+  return String(error?.code || '') === '23505';
+}
+
+// Optional Idempotency-Key header of the complete / fail endpoints. Absent (or empty) means
+// no key, so app v1.0.0 keeps today's behaviour. Returns { key } or { error, code }.
+function parseIdempotencyKey(value) {
+  if (value == null || value === '') return { key: null };
+  if (typeof value !== 'string' || value.length > MAX_IDEMPOTENCY_KEY_LENGTH || !IDEMPOTENCY_KEY_RE.test(value)) {
+    return invalid(
+      `Idempotency-Key must be at most ${MAX_IDEMPOTENCY_KEY_LENGTH} characters of letters, digits, '.', '_', ':' or '-'`,
+      'INVALID_IDEMPOTENCY_KEY',
+    );
+  }
+  return { key: value };
 }
 
 // Parses the optional payment fields of a completion body. Absent fields stay undefined so
@@ -211,12 +239,16 @@ function excludeFailedStops(stops = [], failedAttempts = [], ownPlan = null) {
 module.exports = {
   DELIVERY_PAYMENT_METHODS,
   FAILURE_REASONS,
+  MAX_IDEMPOTENCY_KEY_LENGTH,
   MAX_SIGNATURE_BYTES,
   decodeSignature,
   dubaiDayRange,
   excludeFailedStops,
+  isMissingColumnError,
   isMissingFunctionError,
+  isUniqueViolationError,
   parseCompletionPayment,
+  parseIdempotencyKey,
   resolveCompletionPayment,
   roundMoney,
   validateFailureRequest,

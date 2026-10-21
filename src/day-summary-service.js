@@ -46,6 +46,27 @@ function attemptToFailure(attempt) {
   };
 }
 
+// Drops delivery_attempts rows recorded twice for one driver request (same driver, order,
+// outcome and client_request_id), e.g. a replay that raced the original on a database without
+// the unique index. The first row (attempts arrive oldest first) is the original. Rows without a
+// key are kept as they are.
+function dedupeDeliveryAttempts(attempts = []) {
+  const seen = new Set();
+  return (attempts || []).filter((attempt) => {
+    const requestKey = attempt?.client_request_id;
+    if (!requestKey) return true;
+    const identity = JSON.stringify([
+      String(attempt.driver_id || ''),
+      String(attempt.order_id || ''),
+      String(attempt.outcome || '').toUpperCase(),
+      String(requestKey),
+    ]);
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
+}
+
 function computeDaySummary({ journal = {}, attempts = [] } = {}) {
   const deliveries = new Map();
   (journal.deliveries || []).forEach((delivery) => {
@@ -55,7 +76,7 @@ function computeDaySummary({ journal = {}, attempts = [] } = {}) {
   (journal.exceptions || []).filter((exception) => exception?.status === 'FAILED' && exception.orderId)
     .forEach((failure) => failures.set(String(failure.orderId), failure));
 
-  (attempts || []).forEach((attempt) => {
+  dedupeDeliveryAttempts(attempts).forEach((attempt) => {
     const orderId = String(attempt?.order_id || '');
     if (!orderId) return;
     const outcome = String(attempt.outcome || '').toUpperCase();
@@ -139,4 +160,4 @@ function computeDaySummary({ journal = {}, attempts = [] } = {}) {
   };
 }
 
-module.exports = { computeDaySummary };
+module.exports = { computeDaySummary, dedupeDeliveryAttempts };

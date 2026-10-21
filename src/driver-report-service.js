@@ -6,6 +6,31 @@ const DEFAULT_BUCKET = 'driver-day-reports';
 const INDEX_PATH = 'reports-index.json';
 const UAE_TIME_ZONE = 'Asia/Dubai';
 
+// Journal entries carry the request's Idempotency-Key (requestKey) when the app sent one. A
+// write for the same order + outcome + key is a replay of a request already journaled: the
+// original entry is kept and nothing is written. Otherwise there is one entry per order and the
+// newest wins. Both return true when the journal changed.
+function upsertJournalDelivery(journal, delivery) {
+  journal.deliveries ||= [];
+  const existingIndex = journal.deliveries.findIndex((item) => item.orderId === delivery.orderId);
+  const existing = existingIndex >= 0 ? journal.deliveries[existingIndex] : null;
+  if (delivery.requestKey && existing?.requestKey === delivery.requestKey) return false;
+  if (existing) journal.deliveries[existingIndex] = delivery;
+  else journal.deliveries.push(delivery);
+  return true;
+}
+
+function upsertJournalFailure(journal, exception) {
+  const isOrderFailure = (item) => item?.status === 'FAILED' && item.orderId === exception.orderId;
+  const exceptions = journal.exceptions || [];
+  if (exception.requestKey && exceptions.some((item) => isOrderFailure(item) && item.requestKey === exception.requestKey)) {
+    return false;
+  }
+  journal.exceptions = exceptions.filter((item) => !isOrderFailure(item));
+  journal.exceptions.push(exception);
+  return true;
+}
+
 function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket = DEFAULT_BUCKET }) {
   const locks = new Map();
   let bucketPromise;
@@ -210,11 +235,10 @@ function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket
         amountDue: optionalNumber(completion.amountDue),
         itemsQuantity: optionalNumber(completion.itemsQuantity),
         invoiceNumber: completion.invoiceNumber || null,
+        ...(completion.requestKey ? { requestKey: completion.requestKey } : {}),
       };
+      if (!upsertJournalDelivery(journal, delivery)) return journal;
       journal.assignedStops[snapshot.orderId] = { ...assigned, ...snapshot };
-      const existingIndex = journal.deliveries.findIndex((item) => item.orderId === snapshot.orderId);
-      if (existingIndex >= 0) journal.deliveries[existingIndex] = delivery;
-      else journal.deliveries.push(delivery);
       journal.driverName = driver.name || journal.driverName;
       touchJournal(journal, completedAt);
       await writeJson(path, journal);
@@ -247,10 +271,9 @@ function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket
         failureNote,
         note: `${snapshot.orderNumber} - ${snapshot.customerName} - failed: ${reasonLabel}${failureNote ? ` (${failureNote})` : ''}`,
         attemptedAt,
+        ...(failure.requestKey ? { requestKey: failure.requestKey } : {}),
       };
-      journal.exceptions = (journal.exceptions || [])
-        .filter((item) => !(item.status === 'FAILED' && item.orderId === snapshot.orderId));
-      journal.exceptions.push(exception);
+      if (!upsertJournalFailure(journal, exception)) return journal;
       journal.driverName = driver.name || journal.driverName;
       touchJournal(journal, attemptedAt);
       await writeJson(path, journal);
@@ -566,4 +589,4 @@ function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket
   };
 }
 
-module.exports = { createDriverReportService };
+module.exports = { createDriverReportService, upsertJournalDelivery, upsertJournalFailure };

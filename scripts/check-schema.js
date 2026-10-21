@@ -20,7 +20,7 @@ const checks = [
   // Optional until supabase-migrations/20261021_driver_delivery_records.sql is applied; deliveries
   // still complete without them (no invoices, failed-delivery reporting unavailable).
   { table: 'invoices', columns: 'id,invoice_number,order_id,order_source,driver_id,customer_name,customer_phone,customer_address,items,subtotal_excl_vat,vat_amount,total_incl_vat,currency,payment_method,amount_paid,issued_at,pdf_bucket,pdf_path,created_at', optional: true, migration: 'delivery-records' },
-  { table: 'delivery_attempts', columns: 'id,order_id,order_source,driver_id,outcome,reason_code,note,payment_method,cash_collected,card_amount,card_reference,empty_bottles_returned,signature_bucket,signature_path,proof_bucket,proof_path,latitude,longitude,attempted_at', optional: true, migration: 'delivery-records' },
+  { table: 'delivery_attempts', columns: 'id,order_id,order_source,driver_id,outcome,reason_code,note,payment_method,cash_collected,card_amount,card_reference,empty_bottles_returned,signature_bucket,signature_path,proof_bucket,proof_path,latitude,longitude,attempted_at,client_request_id', optional: true, migration: 'delivery-records' },
 ];
 
 const OPTIONAL_MIGRATION_HINTS = {

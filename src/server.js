@@ -26,12 +26,15 @@ const {
   decodeSignature,
   dubaiDayRange,
   excludeFailedStops,
+  isMissingColumnError,
   isMissingFunctionError,
+  isUniqueViolationError,
   parseCompletionPayment,
+  parseIdempotencyKey,
   resolveCompletionPayment,
   validateFailureRequest,
 } = require('./delivery-record-service');
-const { computeDaySummary } = require('./day-summary-service');
+const { computeDaySummary, dedupeDeliveryAttempts } = require('./day-summary-service');
 require('dotenv').config();
 
 const app = express();
@@ -2252,12 +2255,73 @@ async function uploadDeliverySignature({ orderId, driverId, signature }) {
   return { bucket: DELIVERY_PROOF_BUCKET, path, mimeType: signature.mimeType, size: signature.bytes.length };
 }
 
+// delivery_attempts.client_request_id stores the Idempotency-Key of the complete / fail request.
+// A database whose table predates the column ignores keys (today's behaviour): warned once and
+// re-checked like a missing table, tracked under a pseudo table name.
+const ATTEMPT_KEY_COLUMN = 'delivery_attempts.client_request_id';
+
+function markAttemptKeyColumnResult(error) {
+  if (!error) {
+    missingDispatchTables.delete(ATTEMPT_KEY_COLUMN);
+    return false;
+  }
+  if (!isMissingColumnError(error, 'client_request_id')) return false;
+  missingDispatchTables.set(ATTEMPT_KEY_COLUMN, Date.now() + DISPATCH_TABLE_RECHECK_MS);
+  if (!warnedMissingDispatchTables.has(ATTEMPT_KEY_COLUMN)) {
+    warnedMissingDispatchTables.add(ATTEMPT_KEY_COLUMN);
+    console.warn(`Supabase column public.${ATTEMPT_KEY_COLUMN} is missing; Idempotency-Key headers are ignored. Apply ${DELIVERY_RECORDS_MIGRATION_FILE} to enable them.`);
+  }
+  return true;
+}
+
+function withoutAttemptKey(row) {
+  const copy = { ...row };
+  delete copy.client_request_id;
+  return copy;
+}
+
+// Inserts a delivery_attempts row; a key is dropped (and the insert retried) when the column is
+// missing. Returns the Supabase { error } for the caller to classify.
+async function writeDeliveryAttempt(row) {
+  let payload = row.client_request_id ? row : withoutAttemptKey(row);
+  if (payload.client_request_id && !dispatchTableAvailable(ATTEMPT_KEY_COLUMN)) payload = withoutAttemptKey(payload);
+  let { error } = await supabase.from('delivery_attempts').insert(payload);
+  if (payload.client_request_id && markAttemptKeyColumnResult(error)) {
+    ({ error } = await supabase.from('delivery_attempts').insert(withoutAttemptKey(payload)));
+  }
+  return { error };
+}
+
+// The attempt an earlier request with the same Idempotency-Key recorded, or null (no key, no
+// such attempt, table or column missing, lookup failed).
+async function findDeliveryAttemptByKey(driverId, requestKey) {
+  if (!requestKey || !dispatchTableAvailable('delivery_attempts') || !dispatchTableAvailable(ATTEMPT_KEY_COLUMN)) return null;
+  try {
+    const { data, error } = await supabase
+      .from('delivery_attempts')
+      .select(DELIVERY_ATTEMPT_COLUMNS)
+      .eq('driver_id', driverId)
+      .eq('client_request_id', requestKey)
+      .order('attempted_at', { ascending: true })
+      .limit(1);
+    if (markDispatchTableResult('delivery_attempts', error, DELIVERY_RECORDS_MIGRATION_FILE)) return null;
+    if (markAttemptKeyColumnResult(error)) return null;
+    if (error) throw error;
+    return data?.[0] || null;
+  } catch (error) {
+    logError('Delivery attempt key lookup failed', error);
+    return null;
+  }
+}
+
 // Returns true when stored. Never throws: a missing table or insert error must not fail the caller.
 async function insertDeliveryAttempt(row) {
   if (!dispatchTableAvailable('delivery_attempts')) return false;
   try {
-    const { error } = await supabase.from('delivery_attempts').insert(row);
+    const { error } = await writeDeliveryAttempt(row);
     if (markDispatchTableResult('delivery_attempts', error, DELIVERY_RECORDS_MIGRATION_FILE)) return false;
+    // A concurrent request with the same Idempotency-Key already stored this attempt.
+    if (isUniqueViolationError(error)) return false;
     if (error) throw error;
     return true;
   } catch (error) {
@@ -2269,19 +2333,24 @@ async function insertDeliveryAttempt(row) {
 async function listDeliveryAttempts({ date, driverId, outcome }) {
   if (!dispatchTableAvailable('delivery_attempts')) throw deliveryRecordsUnavailableError();
   const { start, end } = dubaiDayRange(date);
-  let query = supabase
-    .from('delivery_attempts')
-    .select(DELIVERY_ATTEMPT_COLUMNS)
-    .gte('attempted_at', start)
-    .lt('attempted_at', end)
-    .order('attempted_at', { ascending: true })
-    .limit(2000);
-  if (driverId) query = query.eq('driver_id', driverId);
-  if (outcome) query = query.eq('outcome', outcome);
-  const { data, error } = await query;
+  const runQuery = (columns) => {
+    let query = supabase
+      .from('delivery_attempts')
+      .select(columns)
+      .gte('attempted_at', start)
+      .lt('attempted_at', end)
+      .order('attempted_at', { ascending: true })
+      .limit(2000);
+    if (driverId) query = query.eq('driver_id', driverId);
+    if (outcome) query = query.eq('outcome', outcome);
+    return query;
+  };
+  const withKey = dispatchTableAvailable(ATTEMPT_KEY_COLUMN);
+  let { data, error } = await runQuery(withKey ? `${DELIVERY_ATTEMPT_COLUMNS}, client_request_id` : DELIVERY_ATTEMPT_COLUMNS);
+  if (withKey && markAttemptKeyColumnResult(error)) ({ data, error } = await runQuery(DELIVERY_ATTEMPT_COLUMNS));
   if (markDispatchTableResult('delivery_attempts', error, DELIVERY_RECORDS_MIGRATION_FILE)) throw deliveryRecordsUnavailableError();
   if (error) throw error;
-  return data || [];
+  return dedupeDeliveryAttempts(data || []);
 }
 
 // Today's FAILED attempts for routes/today. Any failure means "none" so routing never breaks.
@@ -2513,6 +2582,52 @@ async function hasRemainingPlannedStops(driverId, completedOrderId, closedOrderI
   }
 }
 
+// --- Idempotent complete / fail (Idempotency-Key header) ---
+// A retried or replayed request whose key already recorded an attempt gets that attempt's
+// result again; the website, storage and the day journal are not touched a second time.
+function sendIdempotencyKeyReused(res) {
+  return res.status(422).json({
+    error: 'This Idempotency-Key was already used for a different delivery request',
+    code: 'IDEMPOTENCY_KEY_REUSED',
+  });
+}
+
+function isReplayOf(attempt, orderId, outcome) {
+  return normalizeOrderId(attempt.order_id) === orderId && attempt.outcome === outcome;
+}
+
+function failureResult(attempt) {
+  return {
+    orderId: String(attempt.order_id),
+    outcome: 'FAILED',
+    reasonCode: attempt.reason_code,
+    attemptedAt: toIsoOrNull(attempt.attempted_at),
+  };
+}
+
+async function completionReplayResult(attempt, driverId) {
+  const orderId = String(attempt.order_id);
+  let invoice = null;
+  try {
+    const record = await findInvoiceByOrder(orderId, driverId);
+    if (record) invoice = invoiceLink(record);
+  } catch (error) {
+    if (!error?.isDeliveryRecordsUnavailable) logError('Replayed completion invoice lookup failed', error);
+  }
+  return {
+    id: orderId,
+    orderId,
+    status: 'DELIVERED',
+    completedAt: toIsoOrNull(attempt.attempted_at),
+    proofStored: Boolean(attempt.proof_path),
+    signatureStored: Boolean(attempt.signature_path),
+    paymentMethod: attempt.payment_method || null,
+    invoice,
+    dayReport: null,
+    replayed: true,
+  };
+}
+
 async function finishDriverDayRecord(req, stop, completion) {
   const driver = driverIdentity(req);
   await driverReports.recordCompletion(driver, stop, completion);
@@ -2545,6 +2660,9 @@ async function finishDriverDayRecord(req, stop, completion) {
 app.post('/api/driver/deliveries/:orderId/complete', sensitiveRateLimit, requireDriverAuth, async (req, res) => {
   const orderId = String(req.params.orderId || '').trim();
   if (!/^[A-Za-z0-9._:-]{6,80}$/.test(orderId)) return res.status(400).json({ error: 'Invalid order id' });
+  const idempotency = parseIdempotencyKey(req.get('Idempotency-Key'));
+  if (idempotency.error) return res.status(400).json({ error: idempotency.error, code: idempotency.code });
+  const requestKey = idempotency.key;
 
   const emptyBottlesReturned = Number(req.body?.emptyBottlesReturned || 0);
   const cashCollected = Number(req.body?.cashCollected || 0);
@@ -2574,6 +2692,12 @@ app.post('/api/driver/deliveries/:orderId/complete', sensitiveRateLimit, require
   let storedProof;
   let storedSignature;
   try {
+    const replayed = await findDeliveryAttemptByKey(req.authUser.id, requestKey);
+    if (replayed) {
+      if (!isReplayOf(replayed, orderId, 'DELIVERED')) return sendIdempotencyKeyReused(res);
+      return res.json(await completionReplayResult(replayed, req.authUser.id));
+    }
+
     const driver = driverIdentity(req);
     const assignedStop = await resolveDriverStop(orderId, assignment.source);
     const location = attemptLocation(req);
@@ -2594,6 +2718,7 @@ app.post('/api/driver/deliveries/:orderId/complete', sensitiveRateLimit, require
       latitude: location.latitude,
       longitude: location.longitude,
       attempted_at: completedAt,
+      client_request_id: requestKey,
     });
 
     if (assignment.source === 'website') {
@@ -2671,6 +2796,7 @@ app.post('/api/driver/deliveries/:orderId/complete', sensitiveRateLimit, require
         amountDue: decision.paymentMethod === 'cash' ? amountDue : 0,
         itemsQuantity: stopItemsQuantity(assignedStop),
         invoiceNumber: invoice?.invoiceNumber || null,
+        requestKey,
       });
       return res.json({
         ...websiteResult,
@@ -2781,6 +2907,7 @@ app.post('/api/driver/deliveries/:orderId/complete', sensitiveRateLimit, require
       amountDue: decision.paymentMethod === 'cash' && isCod ? totalDue : 0,
       itemsQuantity: stopItemsQuantity(assignedStop),
       invoiceNumber: invoice?.invoiceNumber || null,
+      requestKey,
     });
     res.json({
       id: data.id,
@@ -2812,6 +2939,10 @@ app.post('/api/driver/deliveries/:orderId/fail', sensitiveRateLimit, requireDriv
   const orderId = String(req.params.orderId || '').trim();
   if (!/^[A-Za-z0-9._:-]{6,80}$/.test(orderId)) return res.status(400).json({ error: 'Invalid order id' });
 
+  const idempotency = parseIdempotencyKey(req.get('Idempotency-Key'));
+  if (idempotency.error) return res.status(400).json({ error: idempotency.error, code: idempotency.code });
+  const requestKey = idempotency.key;
+
   const failure = validateFailureRequest(req.body || {});
   if (failure.error) return res.status(400).json({ error: failure.error, code: failure.code });
 
@@ -2826,6 +2957,12 @@ app.post('/api/driver/deliveries/:orderId/fail', sensitiveRateLimit, requireDriv
 
   let storedProof;
   try {
+    const replayed = await findDeliveryAttemptByKey(req.authUser.id, requestKey);
+    if (replayed) {
+      if (!isReplayOf(replayed, orderId, 'FAILED')) return sendIdempotencyKeyReused(res);
+      return res.status(201).json(failureResult(replayed));
+    }
+
     if (assignment.source === 'operations') {
       const { data: currentOrder, error: lookupError } = await supabase
         .from('orders')
@@ -2844,7 +2981,7 @@ app.post('/api/driver/deliveries/:orderId/fail', sensitiveRateLimit, requireDriv
     const stop = await resolveDriverStop(orderId, assignment.source);
     const location = failure.latitude != null ? failure : attemptLocation(req);
     const attemptedAt = new Date().toISOString();
-    const { error } = await supabase.from('delivery_attempts').insert({
+    const { error } = await writeDeliveryAttempt({
       order_id: orderId,
       order_source: assignment.source,
       driver_id: req.authUser.id,
@@ -2859,8 +2996,19 @@ app.post('/api/driver/deliveries/:orderId/fail', sensitiveRateLimit, requireDriv
       latitude: location.latitude,
       longitude: location.longitude,
       attempted_at: attemptedAt,
+      client_request_id: requestKey,
     });
     if (markDispatchTableResult('delivery_attempts', error, DELIVERY_RECORDS_MIGRATION_FILE)) throw deliveryRecordsUnavailableError();
+    if (isUniqueViolationError(error) && requestKey) {
+      // A concurrent request with the same key won the insert; its attempt is the result.
+      const raced = await findDeliveryAttemptByKey(req.authUser.id, requestKey);
+      if (raced) {
+        if (storedProof?.path) await supabase.storage.from(storedProof.bucket).remove([storedProof.path]).catch(() => {});
+        storedProof = null;
+        if (!isReplayOf(raced, orderId, 'FAILED')) return sendIdempotencyKeyReused(res);
+        return res.status(201).json(failureResult(raced));
+      }
+    }
     if (error) throw error;
 
     try {
@@ -2869,6 +3017,7 @@ app.post('/api/driver/deliveries/:orderId/fail', sensitiveRateLimit, requireDriv
         reasonCode: failure.reasonCode,
         reasonLabel: failure.reasonLabel,
         note: failure.note,
+        requestKey,
       });
     } catch (journalError) {
       logError('Failed delivery journal update failed', journalError);
