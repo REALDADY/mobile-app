@@ -4,6 +4,15 @@ const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 const { createDriverReportService } = require('./driver-report-service');
 const { createDriverCustomerRequestService } = require('./driver-customer-request-service');
+const {
+  buildDriverRoute,
+  dubaiDateKey,
+  isMissingTableError,
+  normalizeOrderId,
+  removeOrdersFromOtherPlans,
+  resolvePlanDate,
+  validatePlanOrderIds,
+} = require('./route-plan-service');
 require('dotenv').config();
 
 const app = express();
@@ -107,6 +116,215 @@ function getDriverShiftState(driverId) {
     startedAt: null,
     endedAt: null,
   };
+}
+
+// --- Driver dispatch persistence (driver_route_plans, driver_sessions, driver_locations) ---
+// Production may run this code before supabase-migrations/20261020_driver_dispatch.sql is applied.
+// A missing table is warned about once per process, then skipped (memory-only behaviour) and
+// re-checked every few minutes so a later migration is picked up without a restart.
+const DISPATCH_MIGRATION_FILE = 'supabase-migrations/20261020_driver_dispatch.sql';
+const DISPATCH_TABLE_RECHECK_MS = 5 * 60 * 1000;
+const DRIVER_LOCATION_HISTORY_INTERVAL_MS = 20_000;
+const DRIVER_SESSION_LOAD_TIMEOUT_MS = 2_500;
+const missingDispatchTables = new Map();
+const warnedMissingDispatchTables = new Set();
+const driverSessionLoads = new Map();
+const driverSessionWrites = new Map();
+const lastDriverLocationInsertAt = new Map();
+const loggedDriverLocationErrors = new Set();
+
+function dispatchTableAvailable(table) {
+  const retryAt = missingDispatchTables.get(table);
+  return !retryAt || retryAt <= Date.now();
+}
+
+function markDispatchTableResult(table, error) {
+  if (!error) {
+    missingDispatchTables.delete(table);
+    return false;
+  }
+  if (!isMissingTableError(error)) return false;
+  missingDispatchTables.set(table, Date.now() + DISPATCH_TABLE_RECHECK_MS);
+  if (!warnedMissingDispatchTables.has(table)) {
+    warnedMissingDispatchTables.add(table);
+    console.warn(`Supabase table public.${table} is missing; continuing without it. Apply ${DISPATCH_MIGRATION_FILE} to enable it.`);
+  }
+  return true;
+}
+
+function toIsoOrNull(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function finiteOrNull(value) {
+  if (value == null || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function applyDriverSessionRecord(record) {
+  const driverId = String(record.driver_id || '');
+  if (!driverId) return;
+  const shiftStatus = ['ON_DUTY', 'OFF_DUTY'].includes(record.shift_status) ? record.shift_status : null;
+  if (!driverShiftStates.has(driverId) && shiftStatus) {
+    driverShiftStates.set(driverId, {
+      status: shiftStatus,
+      startedAt: toIsoOrNull(record.shift_started_at),
+      endedAt: toIsoOrNull(record.shift_ended_at),
+    });
+  }
+  if (!driverGpsSharingStates.has(driverId) && typeof record.gps_sharing === 'boolean') {
+    driverGpsSharingStates.set(driverId, record.gps_sharing);
+  }
+  const lat = finiteOrNull(record.last_latitude);
+  const lng = finiteOrNull(record.last_longitude);
+  if (!latestDriverLocations.has(driverId) && record.gps_sharing !== false && shiftStatus !== 'OFF_DUTY'
+    && lat != null && lng != null) {
+    latestDriverLocations.set(driverId, {
+      driver_id: driverId,
+      lat,
+      lng,
+      accuracy: finiteOrNull(record.last_accuracy),
+      recorded_at: toIsoOrNull(record.last_location_at) || toIsoOrNull(record.updated_at),
+    });
+  }
+}
+
+// Fills the in-memory caches from driver_sessions for drivers that have no cached shift yet
+// (e.g. after a restart). Loads each driver at most once per process; never throws.
+async function ensureDriverSessionsLoaded(driverIds) {
+  const uniqueIds = [...new Set((driverIds || []).map((id) => String(id || '')).filter(Boolean))];
+  const idsToLoad = uniqueIds.filter((id) => !driverShiftStates.has(id) && !driverSessionLoads.has(id));
+  if (idsToLoad.length && dispatchTableAvailable('driver_sessions')) {
+    const load = (async () => {
+      const { data, error } = await supabase
+        .from('driver_sessions')
+        .select('driver_id, shift_status, shift_started_at, shift_ended_at, gps_sharing, last_latitude, last_longitude, last_accuracy, last_location_at, updated_at')
+        .in('driver_id', idsToLoad)
+        .abortSignal(AbortSignal.timeout(DRIVER_SESSION_LOAD_TIMEOUT_MS));
+      if (markDispatchTableResult('driver_sessions', error)) return;
+      if (error) throw error;
+      (data || []).forEach(applyDriverSessionRecord);
+    })().catch((error) => logError('Driver session load failed', error));
+    idsToLoad.forEach((id) => driverSessionLoads.set(id, load));
+  }
+  await Promise.all(uniqueIds.map((id) => driverSessionLoads.get(id)).filter(Boolean));
+}
+
+async function flushDriverSessionWrites(driverId, entry) {
+  try {
+    while (entry.pending) {
+      const patch = entry.pending;
+      entry.pending = null;
+      const { error } = await supabase
+        .from('driver_sessions')
+        .upsert({ driver_id: driverId, ...patch, updated_at: new Date().toISOString() }, { onConflict: 'driver_id' });
+      if (markDispatchTableResult('driver_sessions', error)) {
+        entry.pending = null;
+        break;
+      }
+      if (error) logError('Driver session persistence failed', error);
+    }
+  } catch (error) {
+    logError('Driver session persistence failed', error);
+  } finally {
+    entry.running = false;
+    if (!entry.pending && driverSessionWrites.get(driverId) === entry) driverSessionWrites.delete(driverId);
+  }
+}
+
+// Write-through to driver_sessions without blocking the request. Writes for one driver are
+// serialised and coalesced, so the last state always wins and frequent GPS pings do not pile up.
+function persistDriverSession(driverId, patch) {
+  if (!driverId || !dispatchTableAvailable('driver_sessions')) return;
+  let entry = driverSessionWrites.get(driverId);
+  if (!entry) {
+    entry = { pending: null, running: false };
+    driverSessionWrites.set(driverId, entry);
+  }
+  entry.pending = { ...entry.pending, ...patch };
+  if (entry.running) return;
+  entry.running = true;
+  flushDriverSessionWrites(driverId, entry);
+}
+
+const CLEARED_DRIVER_SESSION_LOCATION = {
+  last_latitude: null,
+  last_longitude: null,
+  last_accuracy: null,
+  last_location_at: null,
+};
+
+// Appends GPS history (at most one row per driver per 20 s). Fire-and-forget.
+function recordDriverLocationPoint(driverId, location) {
+  if (!UUID_RE.test(String(driverId || '')) || !dispatchTableAvailable('driver_locations')) return;
+  const now = Date.now();
+  if (now - (lastDriverLocationInsertAt.get(driverId) || 0) < DRIVER_LOCATION_HISTORY_INTERVAL_MS) return;
+  lastDriverLocationInsertAt.set(driverId, now);
+
+  Promise.resolve()
+    .then(() => supabase.from('driver_locations').insert({
+      driver_id: driverId,
+      lat: location.lat,
+      lng: location.lng,
+      accuracy: location.accuracy,
+      recorded_at: toIsoOrNull(location.recorded_at) || new Date(now).toISOString(),
+    }))
+    .then(({ error }) => {
+      if (!error || markDispatchTableResult('driver_locations', error)) return;
+      // e.g. 23503 when the driver_id FK to users is still present for configured drivers.
+      // Back off for this driver and log each error code once per process.
+      lastDriverLocationInsertAt.set(driverId, now + DISPATCH_TABLE_RECHECK_MS);
+      const errorKey = String(error.code || error.message || 'unknown');
+      if (!loggedDriverLocationErrors.has(errorKey)) {
+        loggedDriverLocationErrors.add(errorKey);
+        logError('Driver location history insert failed', error);
+      }
+    })
+    .catch((error) => logError('Driver location history insert failed', error));
+}
+
+function routePlansUnavailableError() {
+  const error = new Error(`Driver route plans are unavailable until ${DISPATCH_MIGRATION_FILE} is applied to the database.`);
+  error.isRoutePlanUnavailable = true;
+  return error;
+}
+
+function mapRoutePlanRecord(record) {
+  return {
+    driverId: String(record.driver_id),
+    date: String(record.plan_date || '').slice(0, 10),
+    orderIds: Array.isArray(record.order_ids) ? record.order_ids.map(normalizeOrderId).filter(Boolean) : [],
+    source: record.source || null,
+    createdBy: record.created_by || null,
+    updatedAt: record.updated_at || null,
+  };
+}
+
+const ROUTE_PLAN_COLUMNS = 'driver_id, plan_date, order_ids, source, created_by, updated_at';
+
+async function loadRoutePlans(planDate) {
+  const { data, error } = await supabase
+    .from('driver_route_plans')
+    .select(ROUTE_PLAN_COLUMNS)
+    .eq('plan_date', planDate)
+    .order('driver_id', { ascending: true });
+  if (markDispatchTableResult('driver_route_plans', error)) throw routePlansUnavailableError();
+  if (error) throw error;
+  return (data || []).map(mapRoutePlanRecord);
+}
+
+// Route plans for driver-facing reads: any failure falls back to automatic routing.
+async function loadRoutePlansForDriverRoute(planDate) {
+  if (!dispatchTableAvailable('driver_route_plans')) return [];
+  try {
+    return await loadRoutePlans(planDate);
+  } catch (error) {
+    if (!error?.isRoutePlanUnavailable) logError('Route plan lookup failed; using automatic routing', error);
+    return [];
+  }
 }
 
 async function listAllAuthUsers() {
@@ -498,11 +716,16 @@ function optimizeStopOrder(stops, origin) {
   return optimized;
 }
 
-async function getConfiguredDriverRoute(driverId) {
-  const driverIndex = CONFIGURED_DRIVERS.findIndex((driver) => driver.id === driverId);
-  if (driverIndex < 0) return [];
+function hasStopCoordinates(stop) {
+  return stop.latitude != null && stop.longitude != null
+    && Number.isFinite(stop.latitude) && Number.isFinite(stop.longitude);
+}
 
-  const [websiteResult, operationsResult, boundaries, catalog] = await Promise.all([
+// Every active stop known to the backend: website dispatch feed + active Supabase orders.
+// Stops without usable coordinates are kept with latitude/longitude null so that dispatch
+// plans can still reference them; the automatic split below only uses positioned stops.
+async function loadActiveDispatchStops() {
+  const [websiteResult, operationsResult, catalog] = await Promise.all([
     fetch(WEBSITE_DISPATCH_URL, { headers: { Accept: 'application/json' } })
       .then(async (response) => {
         if (!response.ok) throw new Error(`Website dispatch feed returned ${response.status}`);
@@ -514,17 +737,16 @@ async function getConfiguredDriverRoute(driverId) {
       .select('*, user:users(name, phone, email, address, building, apartment, city, location_lat, location_lng), items:order_items(*)')
       .in('status', ['PENDING', 'OUT_FOR_DELIVERY'])
       .order('created_at', { ascending: true }),
-    getEmirateBoundaries(),
     getProductCatalogMap(),
   ]);
 
   if (operationsResult.error) throw operationsResult.error;
 
   const websiteStops = (websiteResult.orders || []).flatMap((order) => {
-    if (order.latitude == null || order.longitude == null) return [];
-    const latitude = Number(order.latitude);
-    const longitude = Number(order.longitude);
-    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return [];
+    const hasCoordinates = order.latitude != null && order.longitude != null
+      && Number.isFinite(Number(order.latitude)) && Number.isFinite(Number(order.longitude));
+    const latitude = hasCoordinates ? Number(order.latitude) : null;
+    const longitude = hasCoordinates ? Number(order.longitude) : null;
     return [{
       id: order.id,
       orderId: order.id,
@@ -563,9 +785,11 @@ async function getConfiguredDriverRoute(driverId) {
   const operationsStops = (operationsResult.data || []).flatMap((order) => {
     const customer = order.user || {};
     const notes = parseStoredOrderNotes(order.notes);
-    const latitude = Number(order.latitude ?? customer.location_lat);
-    const longitude = Number(order.longitude ?? customer.location_lng);
-    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return [];
+    const rawLatitude = Number(order.latitude ?? customer.location_lat);
+    const rawLongitude = Number(order.longitude ?? customer.location_lng);
+    const hasCoordinates = Number.isFinite(rawLatitude) && Number.isFinite(rawLongitude);
+    const latitude = hasCoordinates ? rawLatitude : null;
+    const longitude = hasCoordinates ? rawLongitude : null;
     return [{
       id: order.id,
       orderId: order.id,
@@ -601,6 +825,19 @@ async function getConfiguredDriverRoute(driverId) {
     }];
   });
 
+  return [...websiteStops, ...operationsStops];
+}
+
+// activeStopsPromise lets callers share one loadActiveDispatchStops() call.
+async function getConfiguredDriverRoute(driverId, activeStopsPromise) {
+  const driverIndex = CONFIGURED_DRIVERS.findIndex((driver) => driver.id === driverId);
+  if (driverIndex < 0) return [];
+
+  const [activeStops, boundaries] = await Promise.all([
+    activeStopsPromise || loadActiveDispatchStops(),
+    getEmirateBoundaries(),
+  ]);
+
   const positionedDrivers = CONFIGURED_DRIVERS.flatMap((driver) => {
     const location = latestDriverLocations.get(driver.id);
     const latitude = Number(location?.lat);
@@ -610,7 +847,7 @@ async function getConfiguredDriverRoute(driverId) {
       : [];
   });
 
-  const plannedForDriver = [...websiteStops, ...operationsStops].filter((stop) => {
+  const plannedForDriver = activeStops.filter(hasStopCoordinates).filter((stop) => {
     if (positionedDrivers.length) {
       const closestDriver = positionedDrivers.reduce((closest, candidate) => {
         const closestDistance = Math.hypot(stop.latitude - closest.latitude, stop.longitude - closest.longitude);
@@ -1662,12 +1899,18 @@ app.post('/api/subscriptions', sensitiveRateLimit, requireCustomerAuth, async (r
 
 app.get('/api/driver/routes/today', requireDriverAuth, async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('orders')
-      .select('*, user:users(name, phone), items:order_items(*)')
-      .eq('assigned_driver_id', req.authUser.id)
-      .in('status', ['PENDING', 'OUT_FOR_DELIVERY'])
-      .order('created_at', { ascending: true });
+    const driverId = req.authUser.id;
+    const planDate = dubaiDateKey();
+    const [{ data, error }, routePlans] = await Promise.all([
+      supabase
+        .from('orders')
+        .select('*, user:users(name, phone), items:order_items(*)')
+        .eq('assigned_driver_id', driverId)
+        .in('status', ['PENDING', 'OUT_FOR_DELIVERY'])
+        .order('created_at', { ascending: true }),
+      loadRoutePlansForDriverRoute(planDate),
+      ensureDriverSessionsLoaded([driverId, ...CONFIGURED_DRIVERS.map((driver) => driver.id)]),
+    ]);
 
     if (error && error.code !== '42703') throw error;
 
@@ -1698,7 +1941,16 @@ app.get('/api/driver/routes/today', requireDriverAuth, async (req, res) => {
       })),
       source: 'operations',
     }));
-    const plannedRoute = await getConfiguredDriverRoute(req.authUser.id);
+    // Only fetch the full active-order pool for plan lookups when this driver has a plan.
+    const ownPlan = routePlans.find((plan) => plan.driverId === driverId);
+    const activeStopsPromise = ownPlan?.orderIds.length ? loadActiveDispatchStops() : null;
+    const candidateStopsPromise = activeStopsPromise
+      ? activeStopsPromise.catch((loadError) => {
+        logError('Route plan stop lookup failed', loadError);
+        return [];
+      })
+      : Promise.resolve([]);
+    const plannedRoute = await getConfiguredDriverRoute(driverId, activeStopsPromise || undefined);
     const combinedByOrder = new Map();
 
     plannedRoute.forEach((stop) => combinedByOrder.set(String(stop.orderId || stop.id), stop));
@@ -1726,9 +1978,17 @@ app.get('/api/driver/routes/today', requireDriverAuth, async (req, res) => {
         : null,
     );
 
-    const responseStops = [...optimizedStops, ...unroutableStops].map((stop, index) => ({
+    const { stops: routeStops, routeSource } = buildDriverRoute({
+      driverId,
+      plans: routePlans,
+      automaticStops: [...optimizedStops, ...unroutableStops],
+      candidateStops: await candidateStopsPromise,
+    });
+
+    const responseStops = routeStops.map((stop, index) => ({
       ...stop,
       routeSequence: index + 1,
+      routeSource,
       assignmentToken: createDeliveryAssignmentToken({
         orderId: String(stop.orderId || stop.id),
         driverId: req.authUser.id,
@@ -1739,6 +1999,8 @@ app.get('/api/driver/routes/today', requireDriverAuth, async (req, res) => {
       { id: req.authUser.id, name: req.driverProfile?.name || req.authUser.user_metadata?.name || 'Driver' },
       responseStops,
     );
+    // The body stays a bare array for app v1.0.0, so the route source is also sent as a header.
+    res.set('X-Route-Source', routeSource);
     return res.json(responseStops);
   } catch (error) {
     logError('Driver route list error', error);
@@ -1746,7 +2008,8 @@ app.get('/api/driver/routes/today', requireDriverAuth, async (req, res) => {
   }
 });
 
-app.get('/api/driver/shift', requireDriverAuth, (req, res) => {
+app.get('/api/driver/shift', requireDriverAuth, async (req, res) => {
+  await ensureDriverSessionsLoaded([req.authUser.id]);
   res.json(getDriverShiftState(req.authUser.id));
 });
 
@@ -1758,10 +2021,17 @@ app.post('/api/driver/shift/start', sensitiveRateLimit, requireDriverAuth, (req,
   };
   driverShiftStates.set(req.authUser.id, shift);
   driverGpsSharingStates.set(req.authUser.id, false);
+  persistDriverSession(req.authUser.id, {
+    shift_status: shift.status,
+    shift_started_at: shift.startedAt,
+    shift_ended_at: null,
+    gps_sharing: false,
+  });
   res.json(shift);
 });
 
 app.post('/api/driver/shift/end', sensitiveRateLimit, requireDriverAuth, async (req, res) => {
+  await ensureDriverSessionsLoaded([req.authUser.id]);
   const previous = getDriverShiftState(req.authUser.id);
   const endedAt = previous.status === 'OFF_DUTY' && previous.endedAt
     ? previous.endedAt
@@ -1775,6 +2045,13 @@ app.post('/api/driver/shift/end', sensitiveRateLimit, requireDriverAuth, async (
   driverShiftStates.set(req.authUser.id, shift);
   driverGpsSharingStates.set(req.authUser.id, false);
   latestDriverLocations.delete(req.authUser.id);
+  persistDriverSession(req.authUser.id, {
+    shift_status: shift.status,
+    shift_started_at: shift.startedAt,
+    shift_ended_at: shift.endedAt,
+    gps_sharing: false,
+    ...CLEARED_DRIVER_SESSION_LOCATION,
+  });
 
   let dayReport = null;
   try {
@@ -1789,17 +2066,20 @@ app.post('/api/driver/shift/end', sensitiveRateLimit, requireDriverAuth, async (
   res.json({ ...shift, dayReport });
 });
 
-app.post('/api/driver/location/start', sensitiveRateLimit, requireDriverAuth, (req, res) => {
+app.post('/api/driver/location/start', sensitiveRateLimit, requireDriverAuth, async (req, res) => {
+  await ensureDriverSessionsLoaded([req.authUser.id]);
   if (getDriverShiftState(req.authUser.id).status === 'OFF_DUTY') {
     return res.status(409).json({ error: 'Start a shift before sharing GPS.', code: 'SHIFT_ENDED' });
   }
   driverGpsSharingStates.set(req.authUser.id, true);
+  persistDriverSession(req.authUser.id, { gps_sharing: true });
   res.json({ sharing: true });
 });
 
 app.post('/api/driver/location/stop', sensitiveRateLimit, requireDriverAuth, (req, res) => {
   driverGpsSharingStates.set(req.authUser.id, false);
   latestDriverLocations.delete(req.authUser.id);
+  persistDriverSession(req.authUser.id, { gps_sharing: false, ...CLEARED_DRIVER_SESSION_LOCATION });
   res.json({ sharing: false });
 });
 
@@ -1810,6 +2090,7 @@ app.post('/api/driver/location', sensitiveRateLimit, requireDriverAuth, async (r
 
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return res.status(400).json({ error: 'Valid coordinates required' });
 
+  await ensureDriverSessionsLoaded([req.authUser.id]);
   if (getDriverShiftState(req.authUser.id).status === 'OFF_DUTY') {
     return res.status(409).json({
       error: 'This shift has ended. Start a new shift before sharing GPS.',
@@ -1831,6 +2112,14 @@ app.post('/api/driver/location', sensitiveRateLimit, requireDriverAuth, async (r
       accuracy: Number.isFinite(accuracy) ? accuracy : null,
       recorded_at: req.body?.recordedAt || new Date().toISOString(),
     });
+    const location = latestDriverLocations.get(req.authUser.id);
+    persistDriverSession(req.authUser.id, {
+      last_latitude: lat,
+      last_longitude: lng,
+      last_accuracy: location.accuracy,
+      last_location_at: toIsoOrNull(location.recorded_at) || new Date().toISOString(),
+    });
+    recordDriverLocationPoint(req.authUser.id, location);
     await driverReports.recordLocation(
       { id: req.authUser.id, name: req.driverProfile?.name || req.authUser.user_metadata?.name || 'Driver' },
       latestDriverLocations.get(req.authUser.id),
@@ -1842,6 +2131,21 @@ app.post('/api/driver/location', sensitiveRateLimit, requireDriverAuth, async (r
   }
 });
 
+// True when today's dispatch plan for the driver still has deliverable stops besides the
+// one just completed. Errors count as "remaining" so a day report is never generated early.
+async function hasRemainingPlannedStops(driverId, completedOrderId) {
+  try {
+    const plans = await loadRoutePlansForDriverRoute(dubaiDateKey());
+    const ownPlan = plans.find((plan) => plan.driverId === driverId);
+    if (!ownPlan || !ownPlan.orderIds.some((orderId) => orderId !== completedOrderId)) return false;
+    const { stops } = buildDriverRoute({ driverId, plans, candidateStops: await loadActiveDispatchStops() });
+    return stops.some((plannedStop) => normalizeOrderId(plannedStop.orderId ?? plannedStop.id) !== completedOrderId);
+  } catch (error) {
+    logError('Route plan remaining-stop check failed', error);
+    return true;
+  }
+}
+
 async function finishDriverDayRecord(req, stop, completion) {
   const driver = {
     id: req.authUser.id,
@@ -1849,15 +2153,16 @@ async function finishDriverDayRecord(req, stop, completion) {
   };
   await driverReports.recordCompletion(driver, stop, completion);
 
-  const [plannedRoute, assignedOrders] = await Promise.all([
+  const [plannedRoute, assignedOrders, remainingDispatchPlan] = await Promise.all([
     getConfiguredDriverRoute(req.authUser.id).catch(() => []),
     supabase.from('orders')
       .select('id', { count: 'exact', head: true })
       .eq('assigned_driver_id', req.authUser.id)
       .in('status', ['PENDING', 'OUT_FOR_DELIVERY']),
+    hasRemainingPlannedStops(req.authUser.id, normalizeOrderId(stop?.orderId ?? stop?.id)),
   ]);
   const remainingAssigned = assignedOrders.error ? 1 : Number(assignedOrders.count || 0);
-  if (plannedRoute.length || remainingAssigned) return null;
+  if (plannedRoute.length || remainingAssigned || remainingDispatchPlan) return null;
 
   try {
     return await driverReports.generateReport(driver, driverReports.dateKey(new Date(completion.completedAt)));
@@ -2974,6 +3279,7 @@ app.get('/api/admin/dispatch/overview', requireDispatchReadOnly, async (req, res
         });
       }
     }
+    await ensureDriverSessionsLoaded(driverRecords.map((driver) => driver.id));
     const driverById = new Map(driverRecords.map((driver, index) => [driver.id, { ...driver, color: palette[index % palette.length] }]));
     const activeStopsByDriver = new Map();
     for (const order of activeOrders) {
@@ -3062,6 +3368,118 @@ app.get('/api/admin/dispatch/overview', requireDispatchReadOnly, async (req, res
   } catch (error) {
     logError('Read-only dispatch overview failed', error);
     res.status(500).json({ error: 'Could not load dispatch overview' });
+  }
+});
+
+// --- Admin: Dispatch route plans ---
+// driverId is the same id the dispatch overview returns for drivers and that requireDriverAuth
+// puts on req.authUser.id: users.id for Supabase drivers, CONFIGURED_DRIVERS[].id otherwise.
+async function findDispatchDriver(driverId) {
+  if (!/^[A-Za-z0-9._:-]{1,80}$/.test(driverId)) return null;
+  const configuredDriver = CONFIGURED_DRIVERS.find((driver) => driver.id === driverId);
+  if (configuredDriver) return { id: configuredDriver.id, name: configuredDriver.name };
+  if (!UUID_RE.test(driverId)) return null;
+
+  const { data, error } = await supabase
+    .from('users')
+    .select('id, name, role')
+    .eq('id', driverId)
+    .maybeSingle();
+  if (error) throw error;
+  return data && data.role === 'DRIVER' ? { id: data.id, name: data.name } : null;
+}
+
+function sendRoutePlanError(res, error, fallback) {
+  if (error?.isRoutePlanUnavailable) {
+    return res.status(503).json({ error: error.message, code: 'ROUTE_PLANS_UNAVAILABLE' });
+  }
+  logError(fallback, error);
+  return res.status(500).json({ error: fallback });
+}
+
+app.get('/api/admin/route-plans', requireOperationsAccess, async (req, res) => {
+  const { date, error: dateError } = resolvePlanDate(req.query.date);
+  if (dateError) return res.status(400).json({ error: dateError });
+
+  try {
+    res.json({ date, plans: await loadRoutePlans(date) });
+  } catch (error) {
+    sendRoutePlanError(res, error, 'Could not load route plans');
+  }
+});
+
+app.put('/api/admin/drivers/:driverId/route-plan', requireOperationsAccess, async (req, res) => {
+  const driverId = String(req.params.driverId || '').trim();
+  const { date, error: dateError } = resolvePlanDate(req.body?.date);
+  if (dateError) return res.status(400).json({ error: dateError });
+  const { orderIds, error: orderIdsError } = validatePlanOrderIds(req.body?.orderIds);
+  if (orderIdsError) return res.status(400).json({ error: orderIdsError });
+
+  try {
+    const driver = await findDispatchDriver(driverId);
+    if (!driver) return res.status(404).json({ error: 'Driver not found' });
+
+    // An order may only be planned for one driver per day: take it out of other plans first.
+    // Not transactional; if a later step fails the console can simply resend the plan.
+    const existingPlans = await loadRoutePlans(date);
+    const otherPlanUpdates = removeOrdersFromOtherPlans(existingPlans, driverId, orderIds);
+    const updatedAt = new Date().toISOString();
+    for (const update of otherPlanUpdates) {
+      const query = update.orderIds.length
+        ? supabase
+          .from('driver_route_plans')
+          .update({ order_ids: update.orderIds, updated_at: updatedAt })
+        : supabase.from('driver_route_plans').delete();
+      const { error } = await query.eq('driver_id', update.driverId).eq('plan_date', date);
+      if (markDispatchTableResult('driver_route_plans', error)) throw routePlansUnavailableError();
+      if (error) throw error;
+    }
+
+    const { data, error } = await supabase
+      .from('driver_route_plans')
+      .upsert({
+        driver_id: driverId,
+        plan_date: date,
+        order_ids: orderIds,
+        source: truncateText(req.body?.source, 40) || 'dispatch-console',
+        created_by: truncateText(req.body?.createdBy, 120) || null,
+        updated_at: updatedAt,
+      }, { onConflict: 'driver_id,plan_date' })
+      .select(ROUTE_PLAN_COLUMNS)
+      .single();
+    if (markDispatchTableResult('driver_route_plans', error)) throw routePlansUnavailableError();
+    if (error) throw error;
+
+    res.json({
+      ...mapRoutePlanRecord(data),
+      removedFromDrivers: otherPlanUpdates.map((update) => ({
+        driverId: update.driverId,
+        orderIds: update.removedOrderIds,
+      })),
+    });
+  } catch (error) {
+    sendRoutePlanError(res, error, 'Could not save route plan');
+  }
+});
+
+app.delete('/api/admin/drivers/:driverId/route-plan', requireOperationsAccess, async (req, res) => {
+  const driverId = String(req.params.driverId || '').trim();
+  if (!/^[A-Za-z0-9._:-]{1,80}$/.test(driverId)) return res.status(400).json({ error: 'Invalid driver id' });
+  const { date, error: dateError } = resolvePlanDate(req.query.date);
+  if (dateError) return res.status(400).json({ error: dateError });
+
+  try {
+    const { data, error } = await supabase
+      .from('driver_route_plans')
+      .delete()
+      .eq('driver_id', driverId)
+      .eq('plan_date', date)
+      .select('driver_id');
+    if (markDispatchTableResult('driver_route_plans', error)) throw routePlansUnavailableError();
+    if (error) throw error;
+    res.json({ driverId, date, deleted: (data || []).length > 0 });
+  } catch (error) {
+    sendRoutePlanError(res, error, 'Could not clear route plan');
   }
 });
 
