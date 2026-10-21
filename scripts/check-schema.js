@@ -17,9 +17,18 @@ const checks = [
   // falls back to automatic routing and memory-only driver state without them.
   { table: 'driver_route_plans', columns: 'id,driver_id,plan_date,order_ids,source,created_by,updated_at', optional: true },
   { table: 'driver_sessions', columns: 'driver_id,shift_status,shift_started_at,shift_ended_at,gps_sharing,last_latitude,last_longitude,last_accuracy,last_location_at,updated_at', optional: true },
+  // Optional until supabase-migrations/20261021_driver_delivery_records.sql is applied; deliveries
+  // still complete without them (no invoices, failed-delivery reporting unavailable).
+  { table: 'invoices', columns: 'id,invoice_number,order_id,order_source,driver_id,customer_name,customer_phone,customer_address,items,subtotal_excl_vat,vat_amount,total_incl_vat,currency,payment_method,amount_paid,issued_at,pdf_bucket,pdf_path,created_at', optional: true, migration: 'delivery-records' },
+  { table: 'delivery_attempts', columns: 'id,order_id,order_source,driver_id,outcome,reason_code,note,payment_method,cash_collected,card_amount,card_reference,empty_bottles_returned,signature_bucket,signature_path,proof_bucket,proof_path,latitude,longitude,attempted_at', optional: true, migration: 'delivery-records' },
 ];
 
-let optionalMissing = false;
+const OPTIONAL_MIGRATION_HINTS = {
+  dispatch: 'Optional driver dispatch tables are missing: run supabase-migrations/20261020_driver_dispatch.sql to enable route plans and persisted driver sessions.',
+  'delivery-records': 'Optional delivery record tables are missing: run supabase-migrations/20261021_driver_delivery_records.sql to enable invoices, delivery attempts and failed deliveries.',
+};
+
+const optionalMissing = new Set();
 
 function fail(message) {
   console.error(message);
@@ -35,7 +44,7 @@ async function checkTable(supabase, check) {
 
   const detail = error.message || error.details || 'unknown error';
   if (check.optional) {
-    optionalMissing = true;
+    optionalMissing.add(check.migration || 'dispatch');
     console.warn(`warning optional ${check.table}: ${detail}`);
     return;
   }
@@ -61,9 +70,7 @@ async function main() {
   } else {
     console.log('Supabase schema is ready.');
   }
-  if (optionalMissing) {
-    console.warn('Optional driver dispatch tables are missing: run supabase-migrations/20261020_driver_dispatch.sql to enable route plans and persisted driver sessions.');
-  }
+  optionalMissing.forEach((migration) => console.warn(OPTIONAL_MIGRATION_HINTS[migration]));
 }
 
 main().catch((error) => {

@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const PDFDocument = require('pdfkit');
+const { computeDaySummary } = require('./day-summary-service');
 
 const DEFAULT_BUCKET = 'driver-day-reports';
 const INDEX_PATH = 'reports-index.json';
@@ -106,6 +107,12 @@ function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket
     journal.lastActivityAt = timestamp;
   }
 
+  function optionalNumber(value) {
+    if (value == null || value === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+
   function safeStop(stop = {}) {
     return {
       orderId: String(stop.orderId || stop.id || ''),
@@ -188,6 +195,7 @@ function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket
       if (assigned.customerName && snapshot.customerName === 'Customer') snapshot.customerName = assigned.customerName;
       if (assigned.address && snapshot.address === 'Address not recorded') snapshot.address = assigned.address;
       if (assigned.orderNumber && snapshot.orderNumber === snapshot.orderId) snapshot.orderNumber = assigned.orderNumber;
+      if (snapshot.routeSequence == null && assigned.routeSequence != null) snapshot.routeSequence = assigned.routeSequence;
       const delivery = {
         ...assigned,
         ...snapshot,
@@ -196,6 +204,12 @@ function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket
         note: String(completion.note || snapshot.deliveryInstructions || ''),
         emptyBottlesReturned: Number(completion.emptyBottlesReturned || 0),
         cashCollected: Number(completion.cashCollected || 0),
+        paymentMethod: completion.paymentMethod || null,
+        cardAmount: Number(completion.cardAmount || 0),
+        cardReference: completion.cardReference || null,
+        amountDue: optionalNumber(completion.amountDue),
+        itemsQuantity: optionalNumber(completion.itemsQuantity),
+        invoiceNumber: completion.invoiceNumber || null,
       };
       journal.assignedStops[snapshot.orderId] = { ...assigned, ...snapshot };
       const existingIndex = journal.deliveries.findIndex((item) => item.orderId === snapshot.orderId);
@@ -206,6 +220,58 @@ function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket
       await writeJson(path, journal);
       return journal;
     });
+  }
+
+  // Failed delivery attempts are day exceptions; the order status itself never changes.
+  async function recordFailure(driver, stop, failure = {}) {
+    const attemptedAt = failure.attemptedAt || new Date().toISOString();
+    const reportDate = dateKey(new Date(attemptedAt));
+    return withLock(journalPath(driver.id, reportDate), async () => {
+      const path = journalPath(driver.id, reportDate);
+      const journal = await readJson(path, emptyJournal(driver, reportDate));
+      const snapshot = safeStop(stop);
+      const assigned = journal.assignedStops[snapshot.orderId] || {};
+      if (assigned.customerName && snapshot.customerName === 'Customer') snapshot.customerName = assigned.customerName;
+      if (assigned.address && snapshot.address === 'Address not recorded') snapshot.address = assigned.address;
+      if (assigned.orderNumber && snapshot.orderNumber === snapshot.orderId) snapshot.orderNumber = assigned.orderNumber;
+      const reasonLabel = String(failure.reasonLabel || failure.reasonCode || 'Failed');
+      const failureNote = String(failure.note || '');
+      const exception = {
+        orderId: snapshot.orderId,
+        orderNumber: snapshot.orderNumber,
+        customerName: snapshot.customerName,
+        address: snapshot.address,
+        status: 'FAILED',
+        reasonCode: String(failure.reasonCode || 'OTHER'),
+        reasonLabel,
+        failureNote,
+        note: `${snapshot.orderNumber} - ${snapshot.customerName} - failed: ${reasonLabel}${failureNote ? ` (${failureNote})` : ''}`,
+        attemptedAt,
+      };
+      journal.exceptions = (journal.exceptions || [])
+        .filter((item) => !(item.status === 'FAILED' && item.orderId === snapshot.orderId));
+      journal.exceptions.push(exception);
+      journal.driverName = driver.name || journal.driverName;
+      touchJournal(journal, attemptedAt);
+      await writeJson(path, journal);
+      return journal;
+    });
+  }
+
+  async function readJournal(driver, reportDate = dateKey()) {
+    return readJson(journalPath(driver.id, reportDate), emptyJournal(driver, reportDate));
+  }
+
+  function formatAed(value) {
+    return `AED ${Number(value || 0).toFixed(2)}`;
+  }
+
+  function paymentLabel(delivery) {
+    const method = String(delivery.paymentMethod || '').toLowerCase();
+    if (method === 'card') return `Card ${formatAed(delivery.cardAmount)}`;
+    if (method === 'prepaid') return 'Prepaid';
+    if (method === 'cash' || Number(delivery.cashCollected || 0) > 0) return `Cash ${formatAed(delivery.cashCollected)}`;
+    return 'Prepaid';
   }
 
   function formatTime(value) {
@@ -221,7 +287,7 @@ function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket
     return hours ? `${hours}h ${minutes}m` : `${minutes}m`;
   }
 
-  function drawReport(journal, generatedAt) {
+  function drawReport(journal, generatedAt, summary = computeDaySummary({ journal })) {
     return new Promise((resolve, reject) => {
       const doc = new PDFDocument({ size: 'A4', margin: 42, bufferPages: true, info: {
         Title: `Driver End-of-Day Report - ${journal.driverName} - ${journal.date}`,
@@ -293,7 +359,7 @@ function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket
         .forEach((delivery, index) => {
           const addressHeight = doc.heightOfString(delivery.address || 'Address not recorded', { width: 330, fontSize: 9 });
           const noteHeight = delivery.note ? doc.heightOfString(delivery.note, { width: 455, fontSize: 8 }) + 17 : 0;
-          const blockHeight = Math.max(72, 58 + addressHeight + noteHeight);
+          const blockHeight = Math.max(72, 72 + addressHeight + noteHeight);
           newPageIfNeeded(blockHeight + 12);
           const y = doc.y;
           doc.roundedRect(42, y, contentWidth, blockHeight, 7).fillAndStroke('#FFFFFF', line);
@@ -303,21 +369,65 @@ function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket
           doc.font('Helvetica-Bold').fontSize(9).fillColor(green).text(formatTime(delivery.completedAt), pageWidth - 135, y + 13, { width: 75, align: 'right' });
           doc.font('Helvetica').fontSize(9).fillColor(slate).text(delivery.customerName || 'Customer', 78, y + 29, { width: 235 });
           doc.font('Helvetica').fontSize(9).fillColor(ink).text(delivery.address || 'Address not recorded', 78, y + 45, { width: 420 });
+          const paymentLine = [
+            paymentLabel(delivery),
+            `Empties returned ${Number(delivery.emptyBottlesReturned || 0)}`,
+            delivery.invoiceNumber ? `Invoice ${delivery.invoiceNumber}` : null,
+          ].filter(Boolean).join('  |  ');
+          doc.font('Helvetica').fontSize(8).fillColor(slate).text(paymentLine, 78, y + 49 + addressHeight, { width: 420 });
           if (delivery.note) {
-            const noteY = y + 51 + addressHeight;
+            const noteY = y + 65 + addressHeight;
             doc.font('Helvetica-Bold').fontSize(7).fillColor(violet).text('NOTES / EXCEPTIONS', 78, noteY);
             doc.font('Helvetica').fontSize(8).fillColor(slate).text(delivery.note, 78, noteY + 11, { width: 455 });
           }
           doc.y = y + blockHeight + 10;
         });
 
+      newPageIfNeeded(170);
+      doc.moveDown(0.5);
+      doc.font('Helvetica-Bold').fontSize(15).fillColor(ink).text('Cash & bottles', 42);
+      doc.moveDown(0.5);
+      const cashMetrics = [
+        ['CASH EXPECTED', formatAed(summary.cashExpected)],
+        ['CASH COLLECTED', formatAed(summary.cashCollected)],
+        ['DIFFERENCE', `${summary.cashDifference > 0 ? '+' : ''}${summary.cashDifference.toFixed(2)}`],
+        ['CARD', `${formatAed(summary.cardTotal)} (${summary.cardCount})`],
+        ['PREPAID STOPS', String(summary.prepaidCount)],
+        ['BOTTLES DELIVERED', String(summary.bottlesDelivered)],
+        ['EMPTIES RETURNED', String(summary.emptiesReturned)],
+        ['INVOICES ISSUED', String(summary.invoicesIssued)],
+      ];
+      const cashY = doc.y;
+      cashMetrics.forEach(([name, value], index) => {
+        const x = 42 + (index % 4) * (metricWidth + 8);
+        const boxY = cashY + Math.floor(index / 4) * 63;
+        const mismatch = name === 'DIFFERENCE' && Math.abs(summary.cashDifference) >= 0.01;
+        doc.roundedRect(x, boxY, metricWidth, 55, 7).fillAndStroke(mismatch ? '#FFF4F2' : '#F6F5FC', mismatch ? '#F5D3CC' : '#E6E2F8');
+        label(name, x + 10, boxY + 12);
+        doc.font('Helvetica-Bold').fontSize(12).fillColor(mismatch ? '#B4412E' : ink).text(value, x + 10, boxY + 28, { width: metricWidth - 20 });
+      });
+      doc.x = 42;
+      doc.y = cashY + 126;
+      if (summary.stopsWithUnknownDue) {
+        doc.font('Helvetica').fontSize(8).fillColor(slate)
+          .text(`${summary.stopsWithUnknownDue} cash stop(s) had no recorded amount due and are not included in cash expected.`, 42, doc.y, { width: contentWidth });
+        doc.moveDown(0.5);
+      }
+
       newPageIfNeeded(105);
       doc.moveDown(0.5);
-      doc.font('Helvetica-Bold').fontSize(15).fillColor(ink).text('Day notes and exceptions');
+      doc.font('Helvetica-Bold').fontSize(15).fillColor(ink).text('Day notes and exceptions', 42);
       doc.moveDown(0.5);
       if (journal.exceptions.length) {
         journal.exceptions.forEach((exception) => {
-          doc.font('Helvetica').fontSize(9).fillColor(ink).text(`- ${exception.note || exception.status || 'Exception recorded'}`);
+          if (exception.status === 'FAILED') {
+            newPageIfNeeded(30);
+            doc.font('Helvetica-Bold').fontSize(9).fillColor('#B4412E')
+              .text(`- FAILED ${formatTime(exception.attemptedAt)}: ${exception.orderNumber || exception.orderId} - ${exception.customerName || 'Customer'} - ${exception.reasonLabel || exception.reasonCode}`, 42, doc.y, { width: contentWidth });
+            if (exception.failureNote) doc.font('Helvetica').fontSize(8).fillColor(slate).text(`  ${exception.failureNote}`, 42, doc.y, { width: contentWidth });
+            return;
+          }
+          doc.font('Helvetica').fontSize(9).fillColor(ink).text(`- ${exception.note || exception.status || 'Exception recorded'}`, 42, doc.y, { width: contentWidth });
         });
       } else {
         doc.roundedRect(42, doc.y, contentWidth, 43, 7).fillAndStroke('#EFF9F5', '#D5EFE5');
@@ -369,7 +479,10 @@ function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket
     const lockKey = `report:${driver.id}:${reportDate}`;
     return withLock(lockKey, async () => {
       const journal = await readJson(journalPath(driver.id, reportDate), emptyJournal(driver, reportDate));
-      if (!journal.deliveries.length) {
+      const failedOrderIds = new Set((journal.exceptions || [])
+        .filter((exception) => exception.status === 'FAILED')
+        .map((exception) => exception.orderId));
+      if (!journal.deliveries.length && !failedOrderIds.size) {
         const error = new Error('Complete at least one delivery before generating the end-of-day report');
         error.statusCode = 409;
         error.isValidationError = true;
@@ -378,14 +491,15 @@ function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket
       const generatedAt = new Date().toISOString();
       const completedOrderIds = new Set(journal.deliveries.map((delivery) => delivery.orderId));
       const unfinishedStops = Object.values(journal.assignedStops || {})
-        .filter((stop) => stop.orderId && !completedOrderIds.has(stop.orderId))
+        .filter((stop) => stop.orderId && !completedOrderIds.has(stop.orderId) && !failedOrderIds.has(stop.orderId))
         .map((stop) => ({
           orderId: stop.orderId,
           status: 'NOT COMPLETED',
           note: `${stop.orderNumber || stop.orderId} - ${stop.address || 'address not recorded'} was still open when the day was closed.`,
         }));
       const reportJournal = { ...journal, exceptions: [...(journal.exceptions || []), ...unfinishedStops] };
-      const pdf = await drawReport(reportJournal, generatedAt);
+      const summary = computeDaySummary({ journal });
+      const pdf = await drawReport(reportJournal, generatedAt, summary);
       const objectPath = pdfPath(driver.id, reportDate);
       const { error } = await supabase.storage.from(bucket).upload(objectPath, pdf, {
         contentType: 'application/pdf',
@@ -402,6 +516,11 @@ function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket
         generatedAt,
         completedDeliveries: journal.deliveries.length,
         exceptions: reportJournal.exceptions.length,
+        failedDeliveries: summary.failedDeliveries,
+        cashExpected: summary.cashExpected,
+        cashCollected: summary.cashCollected,
+        cardTotal: summary.cardTotal,
+        emptiesReturned: summary.emptiesReturned,
         distanceKm: journal.locationSamples > 1 ? Number((Number(journal.distanceMeters || 0) / 1000).toFixed(1)) : null,
         activeMinutes: (journal.firstLocationAt || journal.firstActivityAt) && (journal.lastLocationAt || journal.lastActivityAt)
           ? Math.max(0, Math.round((new Date(journal.lastLocationAt || journal.lastActivityAt).getTime() - new Date(journal.firstLocationAt || journal.firstActivityAt).getTime()) / 60000))
@@ -438,6 +557,8 @@ function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket
     recordAssignments,
     recordLocation,
     recordCompletion,
+    recordFailure,
+    readJournal,
     generateReport,
     listReports,
     downloadReport,

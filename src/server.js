@@ -13,6 +13,25 @@ const {
   resolvePlanDate,
   validatePlanOrderIds,
 } = require('./route-plan-service');
+const {
+  buildInvoiceShareText,
+  companyFromEnv,
+  computeInvoiceTotals,
+  renderInvoicePdf,
+  signedInvoiceUrl,
+  verifyInvoiceDownload,
+} = require('./invoice-service');
+const {
+  FAILURE_REASONS,
+  decodeSignature,
+  dubaiDayRange,
+  excludeFailedStops,
+  isMissingFunctionError,
+  parseCompletionPayment,
+  resolveCompletionPayment,
+  validateFailureRequest,
+} = require('./delivery-record-service');
+const { computeDaySummary } = require('./day-summary-service');
 require('dotenv').config();
 
 const app = express();
@@ -32,6 +51,10 @@ const DRIVER_SESSION_SECRET = process.env.DRIVER_SESSION_SECRET || DRIVER_API_KE
 const DELIVERY_PROOF_BUCKET = process.env.DELIVERY_PROOF_BUCKET || 'delivery-proofs';
 const DRIVER_REPORT_BUCKET = process.env.DRIVER_REPORT_BUCKET || 'driver-day-reports';
 const DRIVER_CUSTOMER_REQUEST_BUCKET = process.env.DRIVER_CUSTOMER_REQUEST_BUCKET || 'driver-customer-requests';
+const INVOICE_BUCKET = process.env.INVOICE_BUCKET || 'delivery-invoices';
+const REQUIRE_DELIVERY_SIGNATURE = String(process.env.REQUIRE_DELIVERY_SIGNATURE || '').toLowerCase() === 'true';
+// INVOICE_COMPANY_NAME / _TRN / _ADDRESS / _PHONE / _EMAIL; without a TRN invoices print as RECEIPT.
+const INVOICE_COMPANY = companyFromEnv(process.env);
 const MAX_DELIVERY_PROOF_BYTES = 5 * 1024 * 1024;
 const CONFIGURED_DRIVERS = Array.from({ length: DRIVER_LOGIN_COUNT }, (_, index) => ({
   id: index === 0 ? DRIVER_LOGIN_ID : `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
@@ -138,16 +161,18 @@ function dispatchTableAvailable(table) {
   return !retryAt || retryAt <= Date.now();
 }
 
-function markDispatchTableResult(table, error) {
+// migrationFile names the migration in the warning; a missing RPC function (next_invoice_number)
+// is treated like a missing table of the same migration.
+function markDispatchTableResult(table, error, migrationFile = DISPATCH_MIGRATION_FILE) {
   if (!error) {
     missingDispatchTables.delete(table);
     return false;
   }
-  if (!isMissingTableError(error)) return false;
+  if (!isMissingTableError(error) && !isMissingFunctionError(error)) return false;
   missingDispatchTables.set(table, Date.now() + DISPATCH_TABLE_RECHECK_MS);
   if (!warnedMissingDispatchTables.has(table)) {
     warnedMissingDispatchTables.add(table);
-    console.warn(`Supabase table public.${table} is missing; continuing without it. Apply ${DISPATCH_MIGRATION_FILE} to enable it.`);
+    console.warn(`Supabase table public.${table} is missing; continuing without it. Apply ${migrationFile} to enable it.`);
   }
   return true;
 }
@@ -1901,7 +1926,7 @@ app.get('/api/driver/routes/today', requireDriverAuth, async (req, res) => {
   try {
     const driverId = req.authUser.id;
     const planDate = dubaiDateKey();
-    const [{ data, error }, routePlans] = await Promise.all([
+    const [{ data, error }, routePlans, , failedAttempts] = await Promise.all([
       supabase
         .from('orders')
         .select('*, user:users(name, phone), items:order_items(*)')
@@ -1910,6 +1935,7 @@ app.get('/api/driver/routes/today', requireDriverAuth, async (req, res) => {
         .order('created_at', { ascending: true }),
       loadRoutePlansForDriverRoute(planDate),
       ensureDriverSessionsLoaded([driverId, ...CONFIGURED_DRIVERS.map((driver) => driver.id)]),
+      loadFailedAttemptsForDriver(driverId, planDate),
     ]);
 
     if (error && error.code !== '42703') throw error;
@@ -1985,8 +2011,10 @@ app.get('/api/driver/routes/today', requireDriverAuth, async (req, res) => {
       candidateStops: await candidateStopsPromise,
     });
 
-    const responseStops = routeStops.map((stop, index) => ({
+    // Stops this driver reported as FAILED today leave the list until the dispatcher re-plans them.
+    const responseStops = excludeFailedStops(routeStops, failedAttempts, ownPlan).map((stop, index) => ({
       ...stop,
+      sequence: index + 1,
       routeSequence: index + 1,
       routeSource,
       assignmentToken: createDeliveryAssignmentToken({
@@ -2131,15 +2159,354 @@ app.post('/api/driver/location', sensitiveRateLimit, requireDriverAuth, async (r
   }
 });
 
+// --- Delivery records (invoices, delivery_attempts) ---
+// Optional until supabase-migrations/20261021_driver_delivery_records.sql is applied: completion
+// keeps working without invoices, failed-delivery endpoints answer 503. Uses the same
+// warn-once / re-check helpers as the dispatch tables.
+const DELIVERY_RECORDS_MIGRATION_FILE = 'supabase-migrations/20261021_driver_delivery_records.sql';
+const INVOICE_COLUMNS = 'id, invoice_number, order_id, order_source, driver_id, customer_name, customer_phone, customer_address, items, subtotal_excl_vat, vat_amount, total_incl_vat, currency, payment_method, amount_paid, issued_at, pdf_bucket, pdf_path, created_at';
+const DELIVERY_ATTEMPT_COLUMNS = 'id, order_id, order_source, driver_id, outcome, reason_code, note, payment_method, cash_collected, card_amount, card_reference, empty_bottles_returned, signature_bucket, signature_path, proof_bucket, proof_path, latitude, longitude, attempted_at';
+
+function deliveryRecordsUnavailableError() {
+  const error = new Error(`Delivery records are unavailable until ${DELIVERY_RECORDS_MIGRATION_FILE} is applied to the database.`);
+  error.isDeliveryRecordsUnavailable = true;
+  return error;
+}
+
+function sendDeliveryRecordError(res, error, context, fallback) {
+  if (error?.isDeliveryRecordsUnavailable) {
+    return res.status(503).json({ error: error.message, code: 'DELIVERY_RECORDS_UNAVAILABLE' });
+  }
+  logError(context, error);
+  return res.status(error?.isValidationError ? 400 : 500).json({ error: getPublicErrorMessage(error, fallback) });
+}
+
+function driverIdentity(req) {
+  return {
+    id: req.authUser.id,
+    name: req.driverProfile?.name || req.authUser.user_metadata?.name || 'Driver',
+  };
+}
+
+async function driverNameFor(driverId) {
+  const configured = CONFIGURED_DRIVERS.find((driver) => driver.id === driverId);
+  if (configured) return configured.name;
+  if (!UUID_RE.test(String(driverId || ''))) return 'Driver';
+  const { data } = await supabase.from('users').select('name').eq('id', driverId).maybeSingle();
+  return data?.name || 'Driver';
+}
+
+// Stop snapshot for completion / failure records, from the same pool routes/today resolves
+// planned and automatic stops from (website feed + active Supabase orders).
+async function resolveDriverStop(orderId, source) {
+  try {
+    const activeStops = await loadActiveDispatchStops();
+    const stop = activeStops.find((candidate) => normalizeOrderId(candidate.orderId ?? candidate.id) === orderId);
+    if (stop) return { ...stop, resolved: true };
+  } catch (error) {
+    logError('Delivery stop lookup failed', error);
+  }
+  return {
+    id: orderId,
+    orderId,
+    orderNumber: orderId,
+    customerName: 'Customer',
+    address: 'Address not recorded',
+    source,
+    items: [],
+    resolved: false,
+  };
+}
+
+function stopItemsQuantity(stop) {
+  if (!Array.isArray(stop?.items) || !stop.items.length) return null;
+  return stop.items.reduce((sum, item) => sum + (Number(item.quantity) || 0), 0);
+}
+
+function attemptLocation(req) {
+  const latitude = Number(req.body?.latitude);
+  const longitude = Number(req.body?.longitude);
+  if (req.body?.latitude != null && req.body?.longitude != null && Number.isFinite(latitude) && Number.isFinite(longitude)
+    && Math.abs(latitude) <= 90 && Math.abs(longitude) <= 180) {
+    return { latitude, longitude };
+  }
+  const location = latestDriverLocations.get(req.authUser.id);
+  const lastLatitude = Number(location?.lat);
+  const lastLongitude = Number(location?.lng);
+  return Number.isFinite(lastLatitude) && Number.isFinite(lastLongitude)
+    ? { latitude: lastLatitude, longitude: lastLongitude }
+    : { latitude: null, longitude: null };
+}
+
+async function uploadDeliverySignature({ orderId, driverId, signature }) {
+  await ensureDeliveryProofBucket();
+  const safeOrderId = orderId.replace(/[^A-Za-z0-9._-]/g, '_');
+  const path = `signatures/${safeOrderId}/${Date.now()}-${crypto.randomBytes(8).toString('hex')}.${signature.extension}`;
+  const { error } = await supabase.storage.from(DELIVERY_PROOF_BUCKET).upload(path, signature.bytes, {
+    contentType: signature.mimeType,
+    cacheControl: '3600',
+    upsert: false,
+    metadata: { orderId, driverId, kind: 'signature' },
+  });
+  if (error) throw error;
+  return { bucket: DELIVERY_PROOF_BUCKET, path, mimeType: signature.mimeType, size: signature.bytes.length };
+}
+
+// Returns true when stored. Never throws: a missing table or insert error must not fail the caller.
+async function insertDeliveryAttempt(row) {
+  if (!dispatchTableAvailable('delivery_attempts')) return false;
+  try {
+    const { error } = await supabase.from('delivery_attempts').insert(row);
+    if (markDispatchTableResult('delivery_attempts', error, DELIVERY_RECORDS_MIGRATION_FILE)) return false;
+    if (error) throw error;
+    return true;
+  } catch (error) {
+    logError('Delivery attempt insert failed', error);
+    return false;
+  }
+}
+
+async function listDeliveryAttempts({ date, driverId, outcome }) {
+  if (!dispatchTableAvailable('delivery_attempts')) throw deliveryRecordsUnavailableError();
+  const { start, end } = dubaiDayRange(date);
+  let query = supabase
+    .from('delivery_attempts')
+    .select(DELIVERY_ATTEMPT_COLUMNS)
+    .gte('attempted_at', start)
+    .lt('attempted_at', end)
+    .order('attempted_at', { ascending: true })
+    .limit(2000);
+  if (driverId) query = query.eq('driver_id', driverId);
+  if (outcome) query = query.eq('outcome', outcome);
+  const { data, error } = await query;
+  if (markDispatchTableResult('delivery_attempts', error, DELIVERY_RECORDS_MIGRATION_FILE)) throw deliveryRecordsUnavailableError();
+  if (error) throw error;
+  return data || [];
+}
+
+// Today's FAILED attempts for routes/today. Any failure means "none" so routing never breaks.
+async function loadFailedAttemptsForDriver(driverId, date) {
+  try {
+    const rows = await listDeliveryAttempts({ date, driverId, outcome: 'FAILED' });
+    return rows.map((row) => ({ orderId: normalizeOrderId(row.order_id), attemptedAt: row.attempted_at }));
+  } catch (error) {
+    if (!error?.isDeliveryRecordsUnavailable) logError('Failed delivery lookup failed', error);
+    return [];
+  }
+}
+
+function mapDeliveryAttemptRecord(record) {
+  return {
+    id: record.id,
+    orderId: String(record.order_id),
+    orderSource: record.order_source || null,
+    driverId: record.driver_id,
+    outcome: record.outcome,
+    reasonCode: record.reason_code || null,
+    reasonLabel: record.reason_code ? FAILURE_REASONS[record.reason_code] || record.reason_code : null,
+    note: record.note || null,
+    paymentMethod: record.payment_method || null,
+    cashCollected: Number(record.cash_collected || 0),
+    cardAmount: Number(record.card_amount || 0),
+    cardReference: record.card_reference || null,
+    emptyBottlesReturned: Number(record.empty_bottles_returned || 0),
+    proof: record.proof_path ? { bucket: record.proof_bucket, path: record.proof_path } : null,
+    signature: record.signature_path ? { bucket: record.signature_bucket, path: record.signature_path } : null,
+    latitude: finiteOrNull(record.latitude),
+    longitude: finiteOrNull(record.longitude),
+    attemptedAt: record.attempted_at,
+  };
+}
+
+let invoiceBucketPromise;
+async function ensureInvoiceBucket() {
+  if (!invoiceBucketPromise) {
+    invoiceBucketPromise = (async () => {
+      const { data, error } = await supabase.storage.getBucket(INVOICE_BUCKET);
+      if (data && !error) return;
+      const { error: createError } = await supabase.storage.createBucket(INVOICE_BUCKET, {
+        public: false,
+        fileSizeLimit: 5 * 1024 * 1024,
+        allowedMimeTypes: ['application/pdf'],
+      });
+      const alreadyExists = /already exists|duplicate/i.test(String(createError?.message || ''));
+      if (createError && !alreadyExists) throw createError;
+    })().catch((error) => {
+      invoiceBucketPromise = undefined;
+      throw error;
+    });
+  }
+  return invoiceBucketPromise;
+}
+
+// { invoiceNumber, url, shareText }: the completion response and the per-delivery endpoint.
+// url is a public HMAC-signed download link valid for 7 days.
+function invoiceLink(record) {
+  const url = signedInvoiceUrl({ apiBaseUrl: API_BASE_URL, secret: DRIVER_SESSION_SECRET, invoiceId: record.id });
+  return {
+    invoiceNumber: record.invoice_number,
+    url,
+    shareText: buildInvoiceShareText({ invoice: record, company: INVOICE_COMPANY, url }),
+  };
+}
+
+function mapInvoiceRecord(record) {
+  return {
+    id: record.id,
+    invoiceNumber: record.invoice_number,
+    orderId: record.order_id,
+    orderSource: record.order_source,
+    driverId: record.driver_id,
+    customerName: record.customer_name || '',
+    customerPhone: record.customer_phone || '',
+    customerAddress: record.customer_address || '',
+    items: Array.isArray(record.items) ? record.items : [],
+    subtotalExclVat: Number(record.subtotal_excl_vat || 0),
+    vatAmount: Number(record.vat_amount || 0),
+    totalInclVat: Number(record.total_incl_vat || 0),
+    currency: record.currency || 'AED',
+    paymentMethod: record.payment_method || null,
+    amountPaid: Number(record.amount_paid || 0),
+    issuedAt: record.issued_at,
+    ...invoiceLink(record),
+  };
+}
+
+async function findInvoiceByOrder(orderId, driverId) {
+  if (!dispatchTableAvailable('invoices')) throw deliveryRecordsUnavailableError();
+  let query = supabase.from('invoices').select(INVOICE_COLUMNS).eq('order_id', orderId);
+  if (driverId) query = query.eq('driver_id', driverId);
+  const { data, error } = await query.maybeSingle();
+  if (markDispatchTableResult('invoices', error, DELIVERY_RECORDS_MIGRATION_FILE)) throw deliveryRecordsUnavailableError();
+  if (error) throw error;
+  return data || null;
+}
+
+async function listInvoices({ date, driverId }) {
+  if (!dispatchTableAvailable('invoices')) throw deliveryRecordsUnavailableError();
+  const { start, end } = dubaiDayRange(date);
+  let query = supabase
+    .from('invoices')
+    .select(INVOICE_COLUMNS)
+    .gte('issued_at', start)
+    .lt('issued_at', end)
+    .order('issued_at', { ascending: true })
+    .limit(2000);
+  if (driverId) query = query.eq('driver_id', driverId);
+  const { data, error } = await query;
+  if (markDispatchTableResult('invoices', error, DELIVERY_RECORDS_MIGRATION_FILE)) throw deliveryRecordsUnavailableError();
+  if (error) throw error;
+  return (data || []).map(mapInvoiceRecord);
+}
+
+async function storeInvoicePdf(record, pdf) {
+  await ensureInvoiceBucket();
+  const year = String(record.invoice_number).match(/^INV-(\d{4})-/)?.[1] || String(new Date(record.issued_at).getUTCFullYear());
+  const path = `${year}/${String(record.invoice_number).replace(/[^A-Za-z0-9._-]/g, '_')}.pdf`;
+  const { error } = await supabase.storage.from(INVOICE_BUCKET).upload(path, pdf, {
+    contentType: 'application/pdf',
+    cacheControl: '0',
+    upsert: true,
+  });
+  if (error) throw error;
+  const { data, error: updateError } = await supabase
+    .from('invoices')
+    .update({ pdf_bucket: INVOICE_BUCKET, pdf_path: path })
+    .eq('id', record.id)
+    .select(INVOICE_COLUMNS)
+    .single();
+  if (updateError) throw updateError;
+  return data;
+}
+
+// Issues (or returns the existing) invoice for a completed delivery. Never throws: returns
+// null when the tables are missing, the total is unknown or anything else fails.
+async function issueDeliveryInvoice({ orderId, source, stop, driver, paymentMethod, amountPaid, total, vatAmount, issuedAt }) {
+  if (!dispatchTableAvailable('invoices')) return null;
+  try {
+    const existing = await findInvoiceByOrder(orderId);
+    if (existing) return invoiceLink(existing);
+    if (total == null || !Number.isFinite(Number(total))) {
+      console.warn(`Invoice skipped for ${source} order ${orderId}: the order total is unknown.`);
+      return null;
+    }
+
+    const totals = computeInvoiceTotals({
+      items: (stop.items || []).map((item) => {
+        // Website item names arrive as "Product · Size".
+        const [name, ...size] = String(item.name || 'Item').split(' · ');
+        return {
+          name,
+          size: size.join(' · '),
+          qty: item.quantity,
+          unit_price: item.unitPrice,
+          line_total: item.subtotal,
+        };
+      }),
+      total,
+      vatMode: source === 'website' ? 'inclusive' : 'added',
+      vatAmount,
+    });
+    const { data: invoiceNumber, error: numberError } = await supabase.rpc('next_invoice_number');
+    if (markDispatchTableResult('invoices', numberError, DELIVERY_RECORDS_MIGRATION_FILE)) return null;
+    if (numberError) throw numberError;
+    if (typeof invoiceNumber !== 'string' || !invoiceNumber) throw new Error('next_invoice_number() returned no number');
+
+    const { data: inserted, error: insertError } = await supabase
+      .from('invoices')
+      .insert({
+        invoice_number: invoiceNumber,
+        order_id: orderId,
+        order_source: source,
+        driver_id: driver.id,
+        customer_name: stop.customerName || null,
+        customer_phone: stop.customerPhone || null,
+        customer_address: stop.address || null,
+        items: totals.items,
+        subtotal_excl_vat: totals.subtotal_excl_vat,
+        vat_amount: totals.vat_amount,
+        total_incl_vat: totals.total_incl_vat,
+        currency: 'AED',
+        payment_method: paymentMethod,
+        amount_paid: paymentMethod === 'prepaid' ? totals.total_incl_vat : amountPaid,
+        issued_at: issuedAt,
+      })
+      .select(INVOICE_COLUMNS)
+      .single();
+    if (markDispatchTableResult('invoices', insertError, DELIVERY_RECORDS_MIGRATION_FILE)) return null;
+    if (insertError?.code === '23505') {
+      // A concurrent completion won the unique(order_id) race; its invoice is the invoice.
+      const raced = await findInvoiceByOrder(orderId);
+      if (raced) return invoiceLink(raced);
+    }
+    if (insertError) throw insertError;
+
+    let record = inserted;
+    try {
+      const pdf = await renderInvoicePdf({ ...inserted, driver_name: driver.name }, INVOICE_COMPANY);
+      record = await storeInvoicePdf(inserted, pdf);
+    } catch (pdfError) {
+      // The download endpoint renders the PDF on demand when none is stored.
+      logError('Invoice PDF storage failed', pdfError);
+    }
+    return invoiceLink(record);
+  } catch (error) {
+    if (!error?.isDeliveryRecordsUnavailable) logError('Invoice generation failed', error);
+    return null;
+  }
+}
+
 // True when today's dispatch plan for the driver still has deliverable stops besides the
 // one just completed. Errors count as "remaining" so a day report is never generated early.
-async function hasRemainingPlannedStops(driverId, completedOrderId) {
+// closedOrderIds: stops that no longer count (failed today by this driver).
+async function hasRemainingPlannedStops(driverId, completedOrderId, closedOrderIds = new Set()) {
   try {
     const plans = await loadRoutePlansForDriverRoute(dubaiDateKey());
     const ownPlan = plans.find((plan) => plan.driverId === driverId);
-    if (!ownPlan || !ownPlan.orderIds.some((orderId) => orderId !== completedOrderId)) return false;
+    const isOpen = (orderId) => orderId !== completedOrderId && !closedOrderIds.has(orderId);
+    if (!ownPlan || !ownPlan.orderIds.some(isOpen)) return false;
     const { stops } = buildDriverRoute({ driverId, plans, candidateStops: await loadActiveDispatchStops() });
-    return stops.some((plannedStop) => normalizeOrderId(plannedStop.orderId ?? plannedStop.id) !== completedOrderId);
+    return stops.some((plannedStop) => isOpen(normalizeOrderId(plannedStop.orderId ?? plannedStop.id)));
   } catch (error) {
     logError('Route plan remaining-stop check failed', error);
     return true;
@@ -2147,22 +2514,25 @@ async function hasRemainingPlannedStops(driverId, completedOrderId) {
 }
 
 async function finishDriverDayRecord(req, stop, completion) {
-  const driver = {
-    id: req.authUser.id,
-    name: req.driverProfile?.name || req.authUser.user_metadata?.name || 'Driver',
-  };
+  const driver = driverIdentity(req);
   await driverReports.recordCompletion(driver, stop, completion);
 
+  // Stops that failed today are closed for this driver until the dispatcher re-plans them.
+  const failedOrderIds = new Set((await loadFailedAttemptsForDriver(req.authUser.id, dubaiDateKey()))
+    .map((attempt) => attempt.orderId));
   const [plannedRoute, assignedOrders, remainingDispatchPlan] = await Promise.all([
     getConfiguredDriverRoute(req.authUser.id).catch(() => []),
     supabase.from('orders')
-      .select('id', { count: 'exact', head: true })
+      .select('id')
       .eq('assigned_driver_id', req.authUser.id)
       .in('status', ['PENDING', 'OUT_FOR_DELIVERY']),
-    hasRemainingPlannedStops(req.authUser.id, normalizeOrderId(stop?.orderId ?? stop?.id)),
+    hasRemainingPlannedStops(req.authUser.id, normalizeOrderId(stop?.orderId ?? stop?.id), failedOrderIds),
   ]);
-  const remainingAssigned = assignedOrders.error ? 1 : Number(assignedOrders.count || 0);
-  if (plannedRoute.length || remainingAssigned || remainingDispatchPlan) return null;
+  const remainingRoute = plannedRoute.filter((routeStop) => !failedOrderIds.has(normalizeOrderId(routeStop.orderId ?? routeStop.id)));
+  const remainingAssigned = assignedOrders.error
+    ? 1
+    : (assignedOrders.data || []).filter((order) => !failedOrderIds.has(normalizeOrderId(order.id))).length;
+  if (remainingRoute.length || remainingAssigned || remainingDispatchPlan) return null;
 
   try {
     return await driverReports.generateReport(driver, driverReports.dateKey(new Date(completion.completedAt)));
@@ -2184,6 +2554,14 @@ app.post('/api/driver/deliveries/:orderId/complete', sensitiveRateLimit, require
   if (!Number.isFinite(cashCollected) || cashCollected < 0 || cashCollected > 100000) {
     return res.status(400).json({ error: 'Invalid cash amount' });
   }
+  // Optional fields (app v1.0.0 sends none of them): paymentMethod, cardAmount, cardReference, signature.
+  const payment = parseCompletionPayment(req.body || {});
+  if (payment.error) return res.status(400).json({ error: payment.error, code: payment.code });
+  const signature = decodeSignature(req.body?.signature);
+  if (signature?.error) return res.status(400).json({ error: signature.error, code: signature.code });
+  if (!signature && REQUIRE_DELIVERY_SIGNATURE) {
+    return res.status(400).json({ error: 'A customer signature is required to complete this delivery', code: 'SIGNATURE_REQUIRED' });
+  }
 
   const assignment = verifyDeliveryAssignmentToken(req.body?.assignmentToken, {
     orderId,
@@ -2194,22 +2572,55 @@ app.post('/api/driver/deliveries/:orderId/complete', sensitiveRateLimit, require
   }
 
   let storedProof;
+  let storedSignature;
   try {
-    const routeSnapshot = await getConfiguredDriverRoute(req.authUser.id).catch(() => []);
-    const assignedStop = routeSnapshot.find((stop) => String(stop.orderId || stop.id) === orderId) || {
-      id: orderId,
-      orderId,
-      orderNumber: orderId,
-      customerName: 'Customer',
-      address: 'Address not recorded',
-      source: assignment.source,
-    };
+    const driver = driverIdentity(req);
+    const assignedStop = await resolveDriverStop(orderId, assignment.source);
+    const location = attemptLocation(req);
+    const attemptRow = (completedAt, decision) => ({
+      order_id: orderId,
+      order_source: assignment.source,
+      driver_id: req.authUser.id,
+      outcome: 'DELIVERED',
+      payment_method: decision.paymentMethod,
+      cash_collected: cashCollected,
+      card_amount: payment.cardAmount,
+      card_reference: payment.cardReference,
+      empty_bottles_returned: emptyBottlesReturned,
+      signature_bucket: storedSignature?.bucket || null,
+      signature_path: storedSignature?.path || null,
+      proof_bucket: storedProof?.bucket || null,
+      proof_path: storedProof?.path || null,
+      latitude: location.latitude,
+      longitude: location.longitude,
+      attempted_at: completedAt,
+    });
+
     if (assignment.source === 'website') {
+      // Website totals are VAT-inclusive. The amount due is only known when the stop was
+      // resolved from the feed, and is only enforced for apps that send paymentMethod
+      // (app v1.0.0 keeps today's unchecked behaviour for website orders).
+      const isCod = assignedStop.resolved
+        ? String(assignedStop.paymentMethod || '').toLowerCase() === 'cash_on_delivery'
+        : null;
+      const amountDue = assignedStop.resolved ? Number(assignedStop.cashDue || 0) : null;
+      const decision = resolveCompletionPayment({
+        requestedMethod: payment.paymentMethod,
+        isCod,
+        amountDue: amountDue || 0,
+        cashCollected,
+        cardAmount: payment.cardAmount,
+        totalAmount: assignedStop.totalAmount,
+        enforce: Boolean(payment.paymentMethod) && assignedStop.resolved,
+      });
+      if (decision.error) return res.status(400).json({ error: decision.error, code: decision.code });
+
       storedProof = await uploadDeliveryProof({
         orderId,
         driverId: req.authUser.id,
         proofPhoto: req.body?.proofPhoto,
       });
+      if (signature) storedSignature = await uploadDeliverySignature({ orderId, driverId: req.authUser.id, signature });
       const completedAt = new Date().toISOString();
       const headers = {
         'content-type': 'application/json',
@@ -2232,18 +2643,42 @@ app.post('/api/driver/deliveries/:orderId/complete', sensitiveRateLimit, require
       if (websiteResult.alreadyCompleted) {
         await supabase.storage.from(storedProof.bucket).remove([storedProof.path]);
         storedProof = null;
+        if (storedSignature) {
+          await supabase.storage.from(storedSignature.bucket).remove([storedSignature.path]).catch(() => {});
+          storedSignature = null;
+        }
       }
       const resolvedCompletedAt = websiteResult.completedAt || completedAt;
+      const invoice = await issueDeliveryInvoice({
+        orderId,
+        source: 'website',
+        stop: assignedStop,
+        driver,
+        paymentMethod: decision.paymentMethod,
+        amountPaid: decision.amountPaid,
+        total: assignedStop.resolved ? Number(assignedStop.totalAmount || 0) : null,
+        issuedAt: resolvedCompletedAt,
+      });
+      if (!websiteResult.alreadyCompleted) await insertDeliveryAttempt(attemptRow(resolvedCompletedAt, decision));
       const dayReport = await finishDriverDayRecord(req, assignedStop, {
         completedAt: resolvedCompletedAt,
         status: websiteResult.status || 'DELIVERED',
         emptyBottlesReturned,
         cashCollected,
+        paymentMethod: decision.paymentMethod,
+        cardAmount: payment.cardAmount,
+        cardReference: payment.cardReference,
+        amountDue: decision.paymentMethod === 'cash' ? amountDue : 0,
+        itemsQuantity: stopItemsQuantity(assignedStop),
+        invoiceNumber: invoice?.invoiceNumber || null,
       });
       return res.json({
         ...websiteResult,
         completedAt: resolvedCompletedAt,
         proofStored: !websiteResult.alreadyCompleted,
+        signatureStored: Boolean(storedSignature),
+        paymentMethod: decision.paymentMethod,
+        invoice,
         dayReport,
       });
     }
@@ -2259,15 +2694,23 @@ app.post('/api/driver/deliveries/:orderId/complete', sensitiveRateLimit, require
     }
 
     const totalDue = Number(currentOrder.total_amount || 0);
-    if (String(currentOrder.payment_method || '').toLowerCase() === 'cod' && cashCollected + 0.01 < totalDue) {
-      return res.status(400).json({ error: `Cash collected must cover the AED ${totalDue.toFixed(2)} amount due` });
-    }
+    const isCod = String(currentOrder.payment_method || '').toLowerCase() === 'cod';
+    const decision = resolveCompletionPayment({
+      requestedMethod: payment.paymentMethod,
+      isCod,
+      amountDue: isCod ? totalDue : 0,
+      cashCollected,
+      cardAmount: payment.cardAmount,
+      totalAmount: totalDue,
+    });
+    if (decision.error) return res.status(400).json({ error: decision.error, code: decision.code });
 
     storedProof = await uploadDeliveryProof({
       orderId,
       driverId: req.authUser.id,
       proofPhoto: req.body?.proofPhoto,
     });
+    if (signature) storedSignature = await uploadDeliverySignature({ orderId, driverId: req.authUser.id, signature });
     const completedAt = new Date().toISOString();
     const existingNotes = parseStoredOrderNotes(currentOrder.notes);
     const updateData = {
@@ -2282,12 +2725,27 @@ app.post('/api/driver/deliveries/:orderId/complete', sensitiveRateLimit, require
           driverId: req.authUser.id,
           capturedAt: completedAt,
         },
+        ...(storedSignature ? {
+          deliverySignature: {
+            bucket: storedSignature.bucket,
+            path: storedSignature.path,
+            mimeType: storedSignature.mimeType,
+            size: storedSignature.size,
+            capturedAt: completedAt,
+          },
+        } : {}),
+        deliveryPayment: {
+          method: decision.paymentMethod,
+          cashCollected,
+          cardAmount: payment.cardAmount,
+          cardReference: payment.cardReference,
+        },
         emptyBottlesReturned,
         cashCollected,
         completedAt,
       }),
     };
-    if (String(currentOrder.payment_method || '').toLowerCase() === 'cod' && cashCollected >= totalDue) updateData.payment_status = 'PAID';
+    if (isCod && decision.covered && decision.paymentMethod !== 'prepaid') updateData.payment_status = 'PAID';
 
     const { data, error } = await supabase
       .from('orders')
@@ -2299,12 +2757,30 @@ app.post('/api/driver/deliveries/:orderId/complete', sensitiveRateLimit, require
 
     if (error) throw error;
     fireAndForgetNotification(() => sendPushToUser(data.user_id, orderNotificationPayload('DELIVERED', data.id), 'customer'));
+    const invoice = await issueDeliveryInvoice({
+      orderId,
+      source: 'operations',
+      stop: assignedStop,
+      driver,
+      paymentMethod: decision.paymentMethod,
+      amountPaid: decision.amountPaid,
+      total: totalDue,
+      vatAmount: existingNotes.pricing?.vat,
+      issuedAt: completedAt,
+    });
+    await insertDeliveryAttempt(attemptRow(completedAt, decision));
     const dayReport = await finishDriverDayRecord(req, assignedStop, {
       completedAt,
       status: data.status,
       note: existingNotes.deliveryInstructions || '',
       emptyBottlesReturned,
       cashCollected,
+      paymentMethod: decision.paymentMethod,
+      cardAmount: payment.cardAmount,
+      cardReference: payment.cardReference,
+      amountDue: decision.paymentMethod === 'cash' && isCod ? totalDue : 0,
+      itemsQuantity: stopItemsQuantity(assignedStop),
+      invoiceNumber: invoice?.invoiceNumber || null,
     });
     res.json({
       id: data.id,
@@ -2312,14 +2788,205 @@ app.post('/api/driver/deliveries/:orderId/complete', sensitiveRateLimit, require
       paymentStatus: data.payment_status,
       completedAt,
       proofStored: true,
+      signatureStored: Boolean(storedSignature),
+      paymentMethod: decision.paymentMethod,
+      invoice,
       dayReport,
     });
   } catch (error) {
     if (storedProof?.path) {
       await supabase.storage.from(storedProof.bucket).remove([storedProof.path]).catch(() => {});
     }
+    if (storedSignature?.path) {
+      await supabase.storage.from(storedSignature.bucket).remove([storedSignature.path]).catch(() => {});
+    }
     logError('Driver completion error', error);
     res.status(error?.isValidationError ? 400 : 500).json({ error: getPublicErrorMessage(error, 'Could not complete delivery') });
+  }
+});
+
+// Failed delivery: recorded as a delivery_attempts row + day-report exception. The order status
+// is not changed (there is no failed/rescheduled status) and the website is not called; the
+// dispatcher re-plans the stop.
+app.post('/api/driver/deliveries/:orderId/fail', sensitiveRateLimit, requireDriverAuth, async (req, res) => {
+  const orderId = String(req.params.orderId || '').trim();
+  if (!/^[A-Za-z0-9._:-]{6,80}$/.test(orderId)) return res.status(400).json({ error: 'Invalid order id' });
+
+  const failure = validateFailureRequest(req.body || {});
+  if (failure.error) return res.status(400).json({ error: failure.error, code: failure.code });
+
+  const assignment = verifyDeliveryAssignmentToken(req.body?.assignmentToken, {
+    orderId,
+    driverId: req.authUser.id,
+  });
+  if (!assignment || !['operations', 'website'].includes(assignment.source)) {
+    return res.status(403).json({ error: 'This delivery is not assigned to the signed-in driver' });
+  }
+  if (!dispatchTableAvailable('delivery_attempts')) return sendDeliveryRecordError(res, deliveryRecordsUnavailableError());
+
+  let storedProof;
+  try {
+    if (assignment.source === 'operations') {
+      const { data: currentOrder, error: lookupError } = await supabase
+        .from('orders')
+        .select('id, status')
+        .eq('id', orderId)
+        .single();
+      if (lookupError || !currentOrder) return res.status(404).json({ error: 'Order not found' });
+      if (!['PENDING', 'OUT_FOR_DELIVERY'].includes(String(currentOrder.status || '').toUpperCase())) {
+        return res.status(409).json({ error: `Order is already ${String(currentOrder.status || 'closed').toLowerCase()}` });
+      }
+    }
+
+    if (req.body?.proofPhoto) {
+      storedProof = await uploadDeliveryProof({ orderId, driverId: req.authUser.id, proofPhoto: req.body.proofPhoto });
+    }
+    const stop = await resolveDriverStop(orderId, assignment.source);
+    const location = failure.latitude != null ? failure : attemptLocation(req);
+    const attemptedAt = new Date().toISOString();
+    const { error } = await supabase.from('delivery_attempts').insert({
+      order_id: orderId,
+      order_source: assignment.source,
+      driver_id: req.authUser.id,
+      outcome: 'FAILED',
+      reason_code: failure.reasonCode,
+      note: failure.note,
+      cash_collected: 0,
+      card_amount: 0,
+      empty_bottles_returned: 0,
+      proof_bucket: storedProof?.bucket || null,
+      proof_path: storedProof?.path || null,
+      latitude: location.latitude,
+      longitude: location.longitude,
+      attempted_at: attemptedAt,
+    });
+    if (markDispatchTableResult('delivery_attempts', error, DELIVERY_RECORDS_MIGRATION_FILE)) throw deliveryRecordsUnavailableError();
+    if (error) throw error;
+
+    try {
+      await driverReports.recordFailure(driverIdentity(req), stop, {
+        attemptedAt,
+        reasonCode: failure.reasonCode,
+        reasonLabel: failure.reasonLabel,
+        note: failure.note,
+      });
+    } catch (journalError) {
+      logError('Failed delivery journal update failed', journalError);
+    }
+    return res.status(201).json({ orderId, outcome: 'FAILED', reasonCode: failure.reasonCode, attemptedAt });
+  } catch (error) {
+    if (storedProof?.path) {
+      await supabase.storage.from(storedProof.bucket).remove([storedProof.path]).catch(() => {});
+    }
+    return sendDeliveryRecordError(res, error, 'Driver failed delivery error', 'Could not record failed delivery');
+  }
+});
+
+app.get('/api/driver/deliveries/:orderId/invoice', requireDriverAuth, async (req, res) => {
+  const orderId = String(req.params.orderId || '').trim();
+  if (!/^[A-Za-z0-9._:-]{6,80}$/.test(orderId)) return res.status(400).json({ error: 'Invalid order id' });
+  try {
+    const record = await findInvoiceByOrder(orderId, req.authUser.id);
+    if (!record) return res.status(404).json({ error: 'No invoice was issued for this delivery', code: 'INVOICE_NOT_FOUND' });
+    return res.json(invoiceLink(record));
+  } catch (error) {
+    return sendDeliveryRecordError(res, error, 'Driver invoice lookup error', 'Could not load invoice');
+  }
+});
+
+app.get('/api/driver/invoices', requireDriverAuth, async (req, res) => {
+  const { date, error: dateError } = resolvePlanDate(req.query.date);
+  if (dateError) return res.status(400).json({ error: dateError });
+  try {
+    return res.json({ date, invoices: await listInvoices({ date, driverId: req.authUser.id }) });
+  } catch (error) {
+    return sendDeliveryRecordError(res, error, 'Driver invoice list error', 'Could not load invoices');
+  }
+});
+
+app.get('/api/driver/day-summary', requireDriverAuth, async (req, res) => {
+  const { date, error: dateError } = resolvePlanDate(req.query.date);
+  if (dateError) return res.status(400).json({ error: dateError });
+  try {
+    const [journal, attempts] = await Promise.all([
+      driverReports.readJournal(driverIdentity(req), date),
+      listDeliveryAttempts({ date, driverId: req.authUser.id }).catch((error) => {
+        if (!error?.isDeliveryRecordsUnavailable) logError('Day summary attempt lookup failed', error);
+        return [];
+      }),
+    ]);
+    return res.json(computeDaySummary({ journal, attempts }));
+  } catch (error) {
+    logError('Driver day summary error', error);
+    return res.status(500).json({ error: 'Could not load day summary' });
+  }
+});
+
+app.get('/api/invoices/:invoiceId/download', async (req, res) => {
+  const invoiceId = String(req.params.invoiceId || '');
+  if (!UUID_RE.test(invoiceId) || !verifyInvoiceDownload({
+    secret: DRIVER_SESSION_SECRET,
+    invoiceId,
+    expires: req.query.expires,
+    signature: req.query.signature,
+  })) {
+    return res.status(403).json({ error: 'This invoice link is invalid or has expired' });
+  }
+  try {
+    if (!dispatchTableAvailable('invoices')) throw deliveryRecordsUnavailableError();
+    const { data: record, error } = await supabase.from('invoices').select(INVOICE_COLUMNS).eq('id', invoiceId).maybeSingle();
+    if (markDispatchTableResult('invoices', error, DELIVERY_RECORDS_MIGRATION_FILE)) throw deliveryRecordsUnavailableError();
+    if (error) throw error;
+    if (!record) return res.status(404).json({ error: 'Invoice not found' });
+
+    let bytes;
+    if (record.pdf_bucket && record.pdf_path) {
+      const { data, error: downloadError } = await supabase.storage.from(record.pdf_bucket).download(record.pdf_path);
+      if (!downloadError && data) bytes = Buffer.from(await data.arrayBuffer());
+    }
+    if (!bytes) {
+      // No stored PDF (upload failed at completion): render now and store it in the background.
+      const pdf = await renderInvoicePdf({ ...record, driver_name: await driverNameFor(record.driver_id) }, INVOICE_COMPANY);
+      bytes = pdf;
+      storeInvoicePdf(record, pdf).catch((storeError) => logError('Invoice PDF storage failed', storeError));
+    }
+    const safeName = String(record.invoice_number).replace(/[^A-Za-z0-9._-]+/g, '-');
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Length', bytes.length);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('Content-Disposition', `inline; filename="${safeName}.pdf"`);
+    return res.send(bytes);
+  } catch (error) {
+    return sendDeliveryRecordError(res, error, 'Invoice download error', 'Could not download invoice');
+  }
+});
+
+app.get('/api/admin/invoices', requireOperationsAccess, async (req, res) => {
+  const { date, error: dateError } = resolvePlanDate(req.query.date);
+  if (dateError) return res.status(400).json({ error: dateError });
+  const driverId = req.query.driverId ? String(req.query.driverId).trim() : '';
+  if (driverId.length > 80) return res.status(400).json({ error: 'Invalid driverId' });
+  try {
+    return res.json({ date, driverId: driverId || null, invoices: await listInvoices({ date, driverId: driverId || null }) });
+  } catch (error) {
+    return sendDeliveryRecordError(res, error, 'Admin invoice list error', 'Could not load invoices');
+  }
+});
+
+app.get('/api/admin/delivery-attempts', requireOperationsAccess, async (req, res) => {
+  const { date, error: dateError } = resolvePlanDate(req.query.date);
+  if (dateError) return res.status(400).json({ error: dateError });
+  const outcome = req.query.outcome ? String(req.query.outcome).trim().toUpperCase() : '';
+  if (outcome && !['DELIVERED', 'FAILED'].includes(outcome)) {
+    return res.status(400).json({ error: 'outcome must be DELIVERED or FAILED' });
+  }
+  const driverId = req.query.driverId ? String(req.query.driverId).trim() : '';
+  if (driverId.length > 80) return res.status(400).json({ error: 'Invalid driverId' });
+  try {
+    const attempts = await listDeliveryAttempts({ date, driverId: driverId || null, outcome: outcome || null });
+    return res.json({ date, outcome: outcome || null, attempts: attempts.map(mapDeliveryAttemptRecord) });
+  } catch (error) {
+    return sendDeliveryRecordError(res, error, 'Admin delivery attempt list error', 'Could not load delivery attempts');
   }
 });
 
