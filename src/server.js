@@ -36,6 +36,8 @@ const {
 } = require('./delivery-record-service');
 const { computeDaySummary, dedupeDeliveryAttempts } = require('./day-summary-service');
 const { createDriverStorage, resolveSupabaseConfig } = require('./store');
+const { createEmirateBoundaryLoader } = require('./emirate-boundaries');
+const { createWebsiteDispatchProxy } = require('./website-dispatch-proxy');
 require('dotenv').config();
 
 const app = express();
@@ -70,9 +72,9 @@ const WEBSITE_DISPATCH_URL = process.env.WEBSITE_DISPATCH_URL || 'http://localho
 const WEBSITE_DISPATCH_WRITE_BASE_URL = (process.env.WEBSITE_DISPATCH_WRITE_BASE_URL
   || WEBSITE_DISPATCH_URL.replace(/\/overview\/?$/, '')).replace(/\/$/, '');
 const WEBSITE_DISPATCH_WRITE_KEY = process.env.WEBSITE_DISPATCH_WRITE_KEY || '';
-const EMIRATE_BOUNDARIES_URL = process.env.EMIRATE_BOUNDARIES_URL || 'http://localhost:3000/api/emirates';
+// Optional: without it the bundled data-static/uae-emirates.geojson.json is used (also the fallback).
+const EMIRATE_BOUNDARIES_URL = String(process.env.EMIRATE_BOUNDARIES_URL || '').trim();
 const EMIRATE_ORDER = ['Abu Dhabi', 'Dubai', 'Sharjah', 'Ajman', 'Umm Al Quwain', 'Ras Al Khaimah', 'Fujairah'];
-let cachedEmirateBoundaries;
 const API_BASE_URL = (process.env.API_BASE_URL || process.env.BASE_URL || 'http://localhost:5000').replace(/\/$/, '');
 const PAYMENT_RELAY_BASE_URL = (process.env.NGENIUS_REDIRECT_URL || API_BASE_URL).replace(/\/$/, '');
 const APP_SCHEME = process.env.APP_SCHEME || 'alrawdahsprings';
@@ -700,16 +702,7 @@ function distanceToGeometry(geometry, point) {
   return closest;
 }
 
-async function getEmirateBoundaries() {
-  if (cachedEmirateBoundaries) return cachedEmirateBoundaries;
-  const response = await fetch(EMIRATE_BOUNDARIES_URL, { headers: { Accept: 'application/json' } });
-  if (!response.ok) throw new Error(`Emirate boundary feed returned ${response.status}`);
-  const payload = await response.json();
-  const boundaries = new Map((payload.features || []).map((feature) => [feature.properties?.Emirate_En, feature.geometry]));
-  if (EMIRATE_ORDER.some((emirate) => !boundaries.has(emirate))) throw new Error('Emirate boundary feed is incomplete');
-  cachedEmirateBoundaries = boundaries;
-  return boundaries;
-}
+const getEmirateBoundaries = createEmirateBoundaryLoader({ url: EMIRATE_BOUNDARIES_URL, emirates: EMIRATE_ORDER });
 
 function emirateForPoint(boundaries, point) {
   const containing = EMIRATE_ORDER.find((emirate) => geometryContainsPoint(boundaries.get(emirate), point));
@@ -4049,6 +4042,16 @@ function isNGeniusPaymentPaid(paymentStatus) {
     .map((state) => String(state).toUpperCase());
   return states.some((state) => ['CAPTURED', 'PURCHASED', 'AUTHORISED', 'AUTHORIZED', 'SUCCESS'].includes(state));
 }
+
+// --- Admin: website dispatch feed for the office-PC dispatch console ---
+// Key-protected pass-through (x-dispatch-read-key or x-api-key = ADMIN_API_KEY / DRIVER_API_KEY).
+const websiteDispatchProxy = createWebsiteDispatchProxy({
+  overviewUrl: WEBSITE_DISPATCH_URL,
+  apiKeys: [ADMIN_API_KEY, DRIVER_API_KEY],
+  readKey: process.env.WEBSITE_DISPATCH_READ_KEY || '',
+});
+app.get('/api/admin/website-dispatch/overview', websiteDispatchProxy.requireKey, websiteDispatchProxy.overview);
+app.get('/api/admin/website-dispatch/customers/:id/orders', websiteDispatchProxy.requireKey, websiteDispatchProxy.customerOrders);
 
 // --- Admin: Drivers ---
 app.get('/api/admin/dispatch/overview', requireDispatchReadOnly, async (req, res) => {

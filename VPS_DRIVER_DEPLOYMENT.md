@@ -96,9 +96,13 @@ DRIVER_FILES_DIR=/var/lib/rswater-driver-api/files
 WEBSITE_DISPATCH_URL=http://127.0.0.1:4001/api/dispatch/overview
 WEBSITE_DISPATCH_WRITE_BASE_URL=http://127.0.0.1:4001/api/dispatch
 WEBSITE_DISPATCH_WRITE_KEY=<same value as the website's DISPATCH_WRITE_KEY>
-# Emirate boundary GeoJSON used for automatic routing (the default http://localhost:3000/api/emirates
-# only exists in development). Point it at wherever the website serves it.
-EMIRATE_BOUNDARIES_URL=<url of the emirates GeoJSON>
+# Optional: sent as x-dispatch-read-key to the website's read endpoints, only if the website
+# requires a read key from loopback callers.
+# WEBSITE_DISPATCH_READ_KEY=<the website's dispatch read key>
+# Optional, recommended UNSET on the VPS: emirate polygons for automatic routing then come from the
+# bundled data-static/uae-emirates.geojson.json (same file the console serves at /api/emirates).
+# When set, the URL is fetched and the bundled file is the fallback if it fails.
+# EMIRATE_BOUNDARIES_URL=
 
 # Driver logins: drivers are <DRIVER_LOGIN_USERNAME>1..N, all sharing DRIVER_LOGIN_PASSWORD
 DRIVER_LOGIN_USERNAME=<username prefix>
@@ -201,7 +205,39 @@ curl -s https://driver-api.rswater.ae/api/health
 
 Don't touch the website's existing nginx server blocks.
 
-## 7. Backups
+## 7. Dispatch console on the office PC
+
+On the VPS the website's `/api/dispatch/*` only answers loopback (or a key) and nginx blocks it publicly. The
+driver API therefore re-exposes the two read endpoints the console needs, protected by the API keys:
+
+| Driver API (public, key required)                        | Website (loopback)                         |
+|----------------------------------------------------------|--------------------------------------------|
+| `GET /api/admin/website-dispatch/overview`               | `GET /api/dispatch/overview`               |
+| `GET /api/admin/website-dispatch/customers/:id/orders`   | `GET /api/dispatch/customers/:id/orders`   |
+
+- Auth: header `x-dispatch-read-key` **or** `x-api-key` must equal `ADMIN_API_KEY` or `DRIVER_API_KEY`;
+  anything else gets `401`. There is no loopback exception on these routes.
+- `:id` must be a UUID or `[A-Za-z0-9._:-]{1,80}` (otherwise `400`).
+- The website's status and JSON body are passed through unchanged with `Cache-Control: no-store`; query strings
+  are forwarded. If the website is unreachable or slower than 10 s, the API answers `503 { "error": ... }`.
+- The website base URL is `WEBSITE_DISPATCH_URL` without `/overview`.
+
+Set these in the console's environment on the office PC (placeholders; use the real host and key):
+
+```env
+RSWATER_WEBSITE_DISPATCH_URL=https://driver-api.rswater.ae/api/admin/website-dispatch
+RSWATER_WEBSITE_DISPATCH_KEY=<DRIVER_API_KEY value>
+RSWATER_OPERATIONS_API_URL=https://driver-api.rswater.ae/api
+RSWATER_OPERATIONS_API_KEY=<DRIVER_API_KEY value>
+```
+
+Quick check from the office PC:
+
+```bash
+curl -s -H "x-dispatch-read-key: <DRIVER_API_KEY value>" https://driver-api.rswater.ae/api/admin/website-dispatch/overview | head -c 300
+```
+
+## 8. Backups
 
 - **Database:** the `driver_ops` schema lives in `alrawdah_db`, so the website's existing database backup already
   covers it. To back up only the driver data:
@@ -212,7 +248,7 @@ Don't touch the website's existing nginx server blocks.
   and copy the archive off the machine. Invoice PDFs can be re-rendered from the database, but proofs,
   signatures, day journals and customer requests cannot.
 
-## 8. Rollback
+## 9. Rollback
 
 The driver backend never writes to the website's tables, so rolling back has no effect on the website.
 
