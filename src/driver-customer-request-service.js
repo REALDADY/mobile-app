@@ -1,37 +1,27 @@
 const crypto = require('crypto');
+const { createSupabaseFileStore } = require('./store/files-supabase');
 
 const DEFAULT_BUCKET = 'driver-customer-requests';
 const INDEX_PATH = 'customer-requests.json';
 
-function createDriverCustomerRequestService({ supabase, bucket = DEFAULT_BUCKET }) {
-  let bucketPromise;
+// files: a store from ./store (disk or Supabase Storage); { supabase } alone keeps working.
+function createDriverCustomerRequestService({ files, supabase, bucket = DEFAULT_BUCKET }) {
+  const fileStore = files || createSupabaseFileStore(supabase);
   let writeQueue = Promise.resolve();
 
-  async function ensureBucket() {
-    if (!bucketPromise) {
-      bucketPromise = (async () => {
-        const { data, error } = await supabase.storage.getBucket(bucket);
-        if (data && !error) return;
-        const { error: createError } = await supabase.storage.createBucket(bucket, {
-          public: false,
-          fileSizeLimit: 2 * 1024 * 1024,
-          allowedMimeTypes: ['application/json'],
-        });
-        if (createError && !/already exists|duplicate/i.test(String(createError.message || ''))) throw createError;
-      })().catch((error) => {
-        bucketPromise = undefined;
-        throw error;
-      });
-    }
-    return bucketPromise;
+  function ensureBucket() {
+    return fileStore.ensureBucket(bucket, {
+      fileSizeLimit: 2 * 1024 * 1024,
+      allowedMimeTypes: ['application/json'],
+    });
   }
 
   async function readIndex() {
     await ensureBucket();
-    const { data, error } = await supabase.storage.from(bucket).download(INDEX_PATH);
-    if (error || !data) return { version: 1, requests: [] };
+    const bytes = await fileStore.download(bucket, INDEX_PATH);
+    if (!bytes) return { version: 1, requests: [] };
     try {
-      const parsed = JSON.parse(await data.text());
+      const parsed = JSON.parse(bytes.toString('utf8'));
       return Array.isArray(parsed.requests) ? parsed : { version: 1, requests: [] };
     } catch {
       return { version: 1, requests: [] };
@@ -40,12 +30,11 @@ function createDriverCustomerRequestService({ supabase, bucket = DEFAULT_BUCKET 
 
   async function writeIndex(index) {
     const payload = Buffer.from(JSON.stringify(index, null, 2));
-    const { error } = await supabase.storage.from(bucket).upload(INDEX_PATH, payload, {
+    await fileStore.upload(bucket, INDEX_PATH, payload, {
       contentType: 'application/json',
       cacheControl: '0',
       upsert: true,
     });
-    if (error) throw error;
   }
 
   function mutate(operation) {

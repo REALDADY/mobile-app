@@ -35,14 +35,16 @@ const {
   validateFailureRequest,
 } = require('./delivery-record-service');
 const { computeDaySummary, dedupeDeliveryAttempts } = require('./day-summary-service');
+const { createDriverStorage, resolveSupabaseConfig } = require('./store');
 require('dotenv').config();
 
 const app = express();
 
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const IS_PRODUCTION = NODE_ENV === 'production';
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
+// null when SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are absent: the driver/dispatch features then
+// run on DRIVER_DATABASE_URL (or memory-only) and the legacy customer endpoints answer 503.
+const SUPABASE_CONFIG = resolveSupabaseConfig(process.env);
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
 const DRIVER_API_KEY = process.env.DRIVER_API_KEY;
 const DRIVER_LOGIN_USERNAME = process.env.DRIVER_LOGIN_USERNAME || '';
@@ -90,11 +92,6 @@ function assertHttpUrl(name, value) {
   }
 }
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-  throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY. Configure backend environment variables before starting the API.');
-}
-
-assertHttpUrl('SUPABASE_URL', SUPABASE_URL);
 assertHttpUrl('NGENIUS_BASE_URL', NGENIUS_BASE_URL);
 
 if (IS_PRODUCTION && !(process.env.API_BASE_URL || process.env.BASE_URL)) {
@@ -106,23 +103,46 @@ if (IS_PRODUCTION) {
   assertHttpUrl('NGENIUS_REDIRECT_URL', PAYMENT_RELAY_BASE_URL);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+const supabase = SUPABASE_CONFIG ? createClient(SUPABASE_CONFIG.url, SUPABASE_CONFIG.serviceKey, {
   auth: {
     autoRefreshToken: false,
     persistSession: false,
     detectSessionInUrl: false,
   },
-});
-const driverReports = createDriverReportService({
+}) : null;
+// Driver/dispatch persistence: driver_ops schema + disk files when DRIVER_DATABASE_URL is set,
+// otherwise Supabase tables + Storage (see src/store/index.js).
+const driverStorage = createDriverStorage({
+  env: process.env,
   supabase,
+  apiBaseUrl: API_BASE_URL,
+  signingSecret: DRIVER_SESSION_SECRET,
+});
+const driverStore = driverStorage.store;
+const driverFiles = driverStorage.files;
+console.log(`Driver data storage: ${driverStorage.mode}${driverStorage.filesDir ? ` (files in ${driverStorage.filesDir})` : ''}${supabase ? '' : '; Supabase not configured'}`);
+if (driverStorage.mode === 'none') {
+  console.warn('Neither DRIVER_DATABASE_URL nor Supabase is configured: route plans, sessions, invoices and delivery attempts are not persisted.');
+}
+const driverReports = createDriverReportService({
+  files: driverFiles,
   apiBaseUrl: API_BASE_URL,
   signingSecret: DRIVER_SESSION_SECRET,
   bucket: DRIVER_REPORT_BUCKET,
 });
 const driverCustomerRequests = createDriverCustomerRequestService({
-  supabase,
+  files: driverFiles,
   bucket: DRIVER_CUSTOMER_REQUEST_BUCKET,
 });
+
+// Legacy customer-app endpoints (products, auth, orders, wallet, payments, notifications, ...)
+// exist only on Supabase.
+function requireSupabase(_req, res, next) {
+  if (supabase) return next();
+  return res.status(503).json({ error: 'This endpoint needs Supabase, which is not configured on this server', code: 'SUPABASE_NOT_CONFIGURED' });
+}
+
+const NO_OPERATIONS_ORDERS = Object.freeze({ data: [], error: null });
 
 const ALLOWED_ORDER_STATUSES = new Set(['PENDING', 'OUT_FOR_DELIVERY', 'DELIVERED', 'CANCELLED']);
 const ALLOWED_PAYMENT_METHODS = new Set(['cod', 'wallet', 'card']);
@@ -148,7 +168,8 @@ function getDriverShiftState(driverId) {
 // Production may run this code before supabase-migrations/20261020_driver_dispatch.sql is applied.
 // A missing table is warned about once per process, then skipped (memory-only behaviour) and
 // re-checked every few minutes so a later migration is picked up without a restart.
-const DISPATCH_MIGRATION_FILE = 'supabase-migrations/20261020_driver_dispatch.sql';
+const DRIVER_OPS_SCHEMA_FILE = 'backend/db/driver_ops_schema.sql';
+const DISPATCH_MIGRATION_FILE = driverStore.kind === 'supabase' ? 'supabase-migrations/20261020_driver_dispatch.sql' : DRIVER_OPS_SCHEMA_FILE;
 const DISPATCH_TABLE_RECHECK_MS = 5 * 60 * 1000;
 const DRIVER_LOCATION_HISTORY_INTERVAL_MS = 20_000;
 const DRIVER_SESSION_LOAD_TIMEOUT_MS = 2_500;
@@ -175,7 +196,7 @@ function markDispatchTableResult(table, error, migrationFile = DISPATCH_MIGRATIO
   missingDispatchTables.set(table, Date.now() + DISPATCH_TABLE_RECHECK_MS);
   if (!warnedMissingDispatchTables.has(table)) {
     warnedMissingDispatchTables.add(table);
-    console.warn(`Supabase table public.${table} is missing; continuing without it. Apply ${migrationFile} to enable it.`);
+    console.warn(`${driverStore.schemaLabel}.${table} is missing; continuing without it. Apply ${migrationFile} to enable it.`);
   }
   return true;
 }
@@ -227,11 +248,7 @@ async function ensureDriverSessionsLoaded(driverIds) {
   const idsToLoad = uniqueIds.filter((id) => !driverShiftStates.has(id) && !driverSessionLoads.has(id));
   if (idsToLoad.length && dispatchTableAvailable('driver_sessions')) {
     const load = (async () => {
-      const { data, error } = await supabase
-        .from('driver_sessions')
-        .select('driver_id, shift_status, shift_started_at, shift_ended_at, gps_sharing, last_latitude, last_longitude, last_accuracy, last_location_at, updated_at')
-        .in('driver_id', idsToLoad)
-        .abortSignal(AbortSignal.timeout(DRIVER_SESSION_LOAD_TIMEOUT_MS));
+      const { data, error } = await driverStore.loadDriverSessions(idsToLoad, { timeoutMs: DRIVER_SESSION_LOAD_TIMEOUT_MS });
       if (markDispatchTableResult('driver_sessions', error)) return;
       if (error) throw error;
       (data || []).forEach(applyDriverSessionRecord);
@@ -246,9 +263,7 @@ async function flushDriverSessionWrites(driverId, entry) {
     while (entry.pending) {
       const patch = entry.pending;
       entry.pending = null;
-      const { error } = await supabase
-        .from('driver_sessions')
-        .upsert({ driver_id: driverId, ...patch, updated_at: new Date().toISOString() }, { onConflict: 'driver_id' });
+      const { error } = await driverStore.upsertDriverSession(driverId, { ...patch, updated_at: new Date().toISOString() });
       if (markDispatchTableResult('driver_sessions', error)) {
         entry.pending = null;
         break;
@@ -293,7 +308,7 @@ function recordDriverLocationPoint(driverId, location) {
   lastDriverLocationInsertAt.set(driverId, now);
 
   Promise.resolve()
-    .then(() => supabase.from('driver_locations').insert({
+    .then(() => driverStore.insertDriverLocation({
       driver_id: driverId,
       lat: location.lat,
       lng: location.lng,
@@ -331,14 +346,8 @@ function mapRoutePlanRecord(record) {
   };
 }
 
-const ROUTE_PLAN_COLUMNS = 'driver_id, plan_date, order_ids, source, created_by, updated_at';
-
 async function loadRoutePlans(planDate) {
-  const { data, error } = await supabase
-    .from('driver_route_plans')
-    .select(ROUTE_PLAN_COLUMNS)
-    .eq('plan_date', planDate)
-    .order('driver_id', { ascending: true });
+  const { data, error } = await driverStore.listRoutePlans(planDate);
   if (markDispatchTableResult('driver_route_plans', error)) throw routePlansUnavailableError();
   if (error) throw error;
   return (data || []).map(mapRoutePlanRecord);
@@ -356,6 +365,7 @@ async function loadRoutePlansForDriverRoute(planDate) {
 }
 
 async function listAllAuthUsers() {
+  if (!supabase) return [];
   const users = [];
   let page = 1;
   const perPage = 200;
@@ -453,6 +463,7 @@ function getBearerToken(req) {
 }
 
 async function requireCustomerAuth(req, res, next) {
+  if (!supabase) return requireSupabase(req, res, next);
   try {
     const token = getBearerToken(req);
     if (!token) return res.status(401).json({ error: 'Authentication required' });
@@ -497,6 +508,8 @@ async function requireDriverAuth(req, res, next) {
       req.driverProfile = { id: localDriver.id, name: localDriver.name, role: 'DRIVER' };
       return next();
     }
+    // Supabase driver accounts only exist when Supabase is configured.
+    if (!supabase) return res.status(401).json({ error: 'Invalid or expired session' });
 
     const { data, error } = await supabase.auth.getUser(token);
     if (error || !data?.user?.id) return res.status(401).json({ error: 'Invalid or expired session' });
@@ -588,25 +601,11 @@ function parseStoredOrderNotes(value) {
   }
 }
 
-let deliveryProofBucketPromise;
-async function ensureDeliveryProofBucket() {
-  if (!deliveryProofBucketPromise) {
-    deliveryProofBucketPromise = (async () => {
-      const { data, error } = await supabase.storage.getBucket(DELIVERY_PROOF_BUCKET);
-      if (data && !error) return;
-      const { error: createError } = await supabase.storage.createBucket(DELIVERY_PROOF_BUCKET, {
-        public: false,
-        fileSizeLimit: MAX_DELIVERY_PROOF_BYTES,
-        allowedMimeTypes: ['image/jpeg', 'image/png', 'image/webp'],
-      });
-      const alreadyExists = /already exists|duplicate/i.test(String(createError?.message || ''));
-      if (createError && !alreadyExists) throw createError;
-    })().catch((error) => {
-      deliveryProofBucketPromise = undefined;
-      throw error;
-    });
-  }
-  return deliveryProofBucketPromise;
+function ensureDeliveryProofBucket() {
+  return driverFiles.ensureBucket(DELIVERY_PROOF_BUCKET, {
+    fileSizeLimit: MAX_DELIVERY_PROOF_BYTES,
+    allowedMimeTypes: ['image/jpeg', 'image/png', 'image/webp'],
+  });
 }
 
 async function uploadDeliveryProof({ orderId, driverId, proofPhoto }) {
@@ -639,13 +638,12 @@ async function uploadDeliveryProof({ orderId, driverId, proofPhoto }) {
   const extension = mimeType === 'image/png' ? 'png' : mimeType === 'image/webp' ? 'webp' : 'jpg';
   const safeOrderId = orderId.replace(/[^A-Za-z0-9._-]/g, '_');
   const path = `${safeOrderId}/${Date.now()}-${crypto.randomBytes(8).toString('hex')}.${extension}`;
-  const { error } = await supabase.storage.from(DELIVERY_PROOF_BUCKET).upload(path, bytes, {
+  await driverFiles.upload(DELIVERY_PROOF_BUCKET, path, bytes, {
     contentType: mimeType,
     cacheControl: '3600',
     upsert: false,
     metadata: { orderId, driverId },
   });
-  if (error) throw error;
   return { bucket: DELIVERY_PROOF_BUCKET, path, mimeType, size: bytes.length };
 }
 
@@ -760,12 +758,15 @@ async function loadActiveDispatchStops() {
         return response.json();
       })
       .catch(() => ({ orders: [] })),
+    // Without Supabase the operations source contributes nothing (website feed only).
     supabase
-      .from('orders')
-      .select('*, user:users(name, phone, email, address, building, apartment, city, location_lat, location_lng), items:order_items(*)')
-      .in('status', ['PENDING', 'OUT_FOR_DELIVERY'])
-      .order('created_at', { ascending: true }),
-    getProductCatalogMap(),
+      ? supabase
+        .from('orders')
+        .select('*, user:users(name, phone, email, address, building, apartment, city, location_lat, location_lng), items:order_items(*)')
+        .in('status', ['PENDING', 'OUT_FOR_DELIVERY'])
+        .order('created_at', { ascending: true })
+      : NO_OPERATIONS_ORDERS,
+    supabase ? getProductCatalogMap() : new Map(),
   ]);
 
   if (operationsResult.error) throw operationsResult.error;
@@ -957,6 +958,12 @@ function assertUaeCoordinates(latitude, longitude) {
 }
 
 async function activateDriverCreatedCustomer(request) {
+  if (!supabase) {
+    const error = new Error('Customer accounts cannot be created: Supabase is not configured on this server');
+    error.statusCode = 503;
+    error.isValidationError = true;
+    throw error;
+  }
   const authUsers = await listAllAuthUsers();
   const duplicate = authUsers.find((user) => normalizeUaePhone(user.phone || user.user_metadata?.phone) === request.phone);
   if (duplicate) throw validationError('A customer account already exists with this phone number');
@@ -1420,7 +1427,7 @@ app.get('/api/health', (req, res) => {
 });
 
 // --- Products ---
-app.get('/api/products', async (req, res) => {
+app.get('/api/products', requireSupabase, async (req, res) => {
   try {
     res.json(await loadCatalogProducts());
   } catch (error) {
@@ -1429,7 +1436,7 @@ app.get('/api/products', async (req, res) => {
   }
 });
 
-app.post('/api/pricing/quote', sensitiveRateLimit, async (req, res) => {
+app.post('/api/pricing/quote', requireSupabase, sensitiveRateLimit, async (req, res) => {
   try {
     const items = await validateOrderItems(req.body?.items || []);
     const pricing = calculateOrderPricing(items);
@@ -1450,7 +1457,7 @@ app.post('/api/pricing/quote', sensitiveRateLimit, async (req, res) => {
   }
 });
 
-app.get('/api/coupon-packs', async (_req, res) => {
+app.get('/api/coupon-packs', requireSupabase, async (_req, res) => {
   try {
     res.json(await loadCouponPacks());
   } catch (error) {
@@ -1463,7 +1470,7 @@ app.get('/api/coupon-packs', async (_req, res) => {
 });
 
 // --- Auth / User ---
-app.post('/api/auth/otp/request', sensitiveRateLimit, async (req, res) => {
+app.post('/api/auth/otp/request', requireSupabase, sensitiveRateLimit, async (req, res) => {
   const phone = normalizeUaePhone(req.body?.phone);
   if (!/^\+9715\d{8}$/.test(phone)) {
     return res.status(400).json({ error: 'Valid UAE mobile number required' });
@@ -1490,7 +1497,7 @@ app.post('/api/auth/otp/request', sensitiveRateLimit, async (req, res) => {
   }
 });
 
-app.post('/api/auth/otp/verify', sensitiveRateLimit, async (req, res) => {
+app.post('/api/auth/otp/verify', requireSupabase, sensitiveRateLimit, async (req, res) => {
   const phone = normalizeUaePhone(req.body?.phone);
   const token = String(req.body?.token || '').trim();
 
@@ -1537,7 +1544,7 @@ app.post('/api/auth/otp/verify', sensitiveRateLimit, async (req, res) => {
   }
 });
 
-app.post('/api/auth/refresh', sensitiveRateLimit, async (req, res) => {
+app.post('/api/auth/refresh', requireSupabase, sensitiveRateLimit, async (req, res) => {
   const refreshToken = String(req.body?.refreshToken || '').trim();
   if (!refreshToken) return res.status(400).json({ error: 'Refresh token required' });
 
@@ -1558,7 +1565,7 @@ app.post('/api/auth/refresh', sensitiveRateLimit, async (req, res) => {
   }
 });
 
-app.get('/api/auth/me', requireCustomerAuth, async (req, res) => {
+app.get('/api/auth/me', requireSupabase, requireCustomerAuth, async (req, res) => {
   try {
     const { data: profile, error } = await supabase
       .from('users')
@@ -1669,6 +1676,7 @@ app.post('/api/driver/customer-requests', sensitiveRateLimit, requireDriverAuth,
     });
 
     fireAndForgetNotification(async () => {
+      if (!supabase) return;
       const { data: admins } = await supabase.from('users').select('id').in('role', [...ADMIN_ROLES]);
       if (admins?.length) await sendPushToUsers(admins.map((admin) => admin.id), {
         title: 'New customer approval request',
@@ -1728,7 +1736,7 @@ app.post('/api/auth/login', sensitiveRateLimit, async (req, res) => {
   res.status(410).json({ error: 'Use /api/auth/otp/request and /api/auth/otp/verify for phone OTP login.' });
 });
 
-app.get('/api/orders', requireCustomerAuth, async (req, res) => {
+app.get('/api/orders', requireSupabase, requireCustomerAuth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('orders')
@@ -1761,7 +1769,7 @@ app.get('/api/orders', requireCustomerAuth, async (req, res) => {
   }
 });
 
-app.post('/api/orders', sensitiveRateLimit, requireCustomerAuth, async (req, res) => {
+app.post('/api/orders', requireSupabase, sensitiveRateLimit, requireCustomerAuth, async (req, res) => {
   const { userId: requestedUserId, amount, orderPayload, paymentMethod } = req.body;
   const userId = requireSameCustomer(req, res, requestedUserId);
   if (!userId) return;
@@ -1797,7 +1805,7 @@ app.post('/api/orders', sensitiveRateLimit, requireCustomerAuth, async (req, res
 });
 
 // GET single user (for session refresh / balance sync)
-app.get('/api/users/:id', requireCustomerAuth, async (req, res) => {
+app.get('/api/users/:id', requireSupabase, requireCustomerAuth, async (req, res) => {
   if (!UUID_RE.test(req.params.id)) {
     return res.status(400).json({ error: 'Invalid user id' });
   }
@@ -1818,7 +1826,7 @@ app.get('/api/users/:id', requireCustomerAuth, async (req, res) => {
   }
 });
 
-app.put('/api/users/:id', sensitiveRateLimit, requireCustomerAuth, async (req, res) => {
+app.put('/api/users/:id', requireSupabase, sensitiveRateLimit, requireCustomerAuth, async (req, res) => {
   if (!UUID_RE.test(req.params.id)) {
     return res.status(400).json({ error: 'Invalid user id' });
   }
@@ -1852,7 +1860,7 @@ app.put('/api/users/:id', sensitiveRateLimit, requireCustomerAuth, async (req, r
   }
 });
 
-app.delete('/api/users/:id', sensitiveRateLimit, requireCustomerAuth, async (req, res) => {
+app.delete('/api/users/:id', requireSupabase, sensitiveRateLimit, requireCustomerAuth, async (req, res) => {
   if (!UUID_RE.test(req.params.id)) {
     return res.status(400).json({ error: 'Invalid user id' });
   }
@@ -1869,7 +1877,7 @@ app.delete('/api/users/:id', sensitiveRateLimit, requireCustomerAuth, async (req
   }
 });
 
-app.get('/api/subscriptions', requireCustomerAuth, async (req, res) => {
+app.get('/api/subscriptions', requireSupabase, requireCustomerAuth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('subscriptions')
@@ -1885,7 +1893,7 @@ app.get('/api/subscriptions', requireCustomerAuth, async (req, res) => {
   }
 });
 
-app.post('/api/subscriptions', sensitiveRateLimit, requireCustomerAuth, async (req, res) => {
+app.post('/api/subscriptions', requireSupabase, sensitiveRateLimit, requireCustomerAuth, async (req, res) => {
   const productId = String(req.body?.productId || '').trim();
   const quantity = Number(req.body?.quantity || 1);
   const frequency = String(req.body?.frequency || 'weekly').trim().toLowerCase();
@@ -1931,11 +1939,13 @@ app.get('/api/driver/routes/today', requireDriverAuth, async (req, res) => {
     const planDate = dubaiDateKey();
     const [{ data, error }, routePlans, , failedAttempts] = await Promise.all([
       supabase
-        .from('orders')
-        .select('*, user:users(name, phone), items:order_items(*)')
-        .eq('assigned_driver_id', driverId)
-        .in('status', ['PENDING', 'OUT_FOR_DELIVERY'])
-        .order('created_at', { ascending: true }),
+        ? supabase
+          .from('orders')
+          .select('*, user:users(name, phone), items:order_items(*)')
+          .eq('assigned_driver_id', driverId)
+          .in('status', ['PENDING', 'OUT_FOR_DELIVERY'])
+          .order('created_at', { ascending: true })
+        : NO_OPERATIONS_ORDERS,
       loadRoutePlansForDriverRoute(planDate),
       ensureDriverSessionsLoaded([driverId, ...CONFIGURED_DRIVERS.map((driver) => driver.id)]),
       loadFailedAttemptsForDriver(driverId, planDate),
@@ -2166,9 +2176,7 @@ app.post('/api/driver/location', sensitiveRateLimit, requireDriverAuth, async (r
 // Optional until supabase-migrations/20261021_driver_delivery_records.sql is applied: completion
 // keeps working without invoices, failed-delivery endpoints answer 503. Uses the same
 // warn-once / re-check helpers as the dispatch tables.
-const DELIVERY_RECORDS_MIGRATION_FILE = 'supabase-migrations/20261021_driver_delivery_records.sql';
-const INVOICE_COLUMNS = 'id, invoice_number, order_id, order_source, driver_id, customer_name, customer_phone, customer_address, items, subtotal_excl_vat, vat_amount, total_incl_vat, currency, payment_method, amount_paid, issued_at, pdf_bucket, pdf_path, created_at';
-const DELIVERY_ATTEMPT_COLUMNS = 'id, order_id, order_source, driver_id, outcome, reason_code, note, payment_method, cash_collected, card_amount, card_reference, empty_bottles_returned, signature_bucket, signature_path, proof_bucket, proof_path, latitude, longitude, attempted_at';
+const DELIVERY_RECORDS_MIGRATION_FILE = driverStore.kind === 'supabase' ? 'supabase-migrations/20261021_driver_delivery_records.sql' : DRIVER_OPS_SCHEMA_FILE;
 
 function deliveryRecordsUnavailableError() {
   const error = new Error(`Delivery records are unavailable until ${DELIVERY_RECORDS_MIGRATION_FILE} is applied to the database.`);
@@ -2194,7 +2202,7 @@ function driverIdentity(req) {
 async function driverNameFor(driverId) {
   const configured = CONFIGURED_DRIVERS.find((driver) => driver.id === driverId);
   if (configured) return configured.name;
-  if (!UUID_RE.test(String(driverId || ''))) return 'Driver';
+  if (!UUID_RE.test(String(driverId || '')) || !supabase) return 'Driver';
   const { data } = await supabase.from('users').select('name').eq('id', driverId).maybeSingle();
   return data?.name || 'Driver';
 }
@@ -2245,13 +2253,12 @@ async function uploadDeliverySignature({ orderId, driverId, signature }) {
   await ensureDeliveryProofBucket();
   const safeOrderId = orderId.replace(/[^A-Za-z0-9._-]/g, '_');
   const path = `signatures/${safeOrderId}/${Date.now()}-${crypto.randomBytes(8).toString('hex')}.${signature.extension}`;
-  const { error } = await supabase.storage.from(DELIVERY_PROOF_BUCKET).upload(path, signature.bytes, {
+  await driverFiles.upload(DELIVERY_PROOF_BUCKET, path, signature.bytes, {
     contentType: signature.mimeType,
     cacheControl: '3600',
     upsert: false,
     metadata: { orderId, driverId, kind: 'signature' },
   });
-  if (error) throw error;
   return { bucket: DELIVERY_PROOF_BUCKET, path, mimeType: signature.mimeType, size: signature.bytes.length };
 }
 
@@ -2269,7 +2276,7 @@ function markAttemptKeyColumnResult(error) {
   missingDispatchTables.set(ATTEMPT_KEY_COLUMN, Date.now() + DISPATCH_TABLE_RECHECK_MS);
   if (!warnedMissingDispatchTables.has(ATTEMPT_KEY_COLUMN)) {
     warnedMissingDispatchTables.add(ATTEMPT_KEY_COLUMN);
-    console.warn(`Supabase column public.${ATTEMPT_KEY_COLUMN} is missing; Idempotency-Key headers are ignored. Apply ${DELIVERY_RECORDS_MIGRATION_FILE} to enable them.`);
+    console.warn(`${driverStore.schemaLabel.replace(' table ', ' column ')}.${ATTEMPT_KEY_COLUMN} is missing; Idempotency-Key headers are ignored. Apply ${DELIVERY_RECORDS_MIGRATION_FILE} to enable them.`);
   }
   return true;
 }
@@ -2281,13 +2288,13 @@ function withoutAttemptKey(row) {
 }
 
 // Inserts a delivery_attempts row; a key is dropped (and the insert retried) when the column is
-// missing. Returns the Supabase { error } for the caller to classify.
+// missing. Returns the store's { error } for the caller to classify.
 async function writeDeliveryAttempt(row) {
   let payload = row.client_request_id ? row : withoutAttemptKey(row);
   if (payload.client_request_id && !dispatchTableAvailable(ATTEMPT_KEY_COLUMN)) payload = withoutAttemptKey(payload);
-  let { error } = await supabase.from('delivery_attempts').insert(payload);
+  let { error } = await driverStore.insertDeliveryAttempt(payload);
   if (payload.client_request_id && markAttemptKeyColumnResult(error)) {
-    ({ error } = await supabase.from('delivery_attempts').insert(withoutAttemptKey(payload)));
+    ({ error } = await driverStore.insertDeliveryAttempt(withoutAttemptKey(payload)));
   }
   return { error };
 }
@@ -2297,17 +2304,11 @@ async function writeDeliveryAttempt(row) {
 async function findDeliveryAttemptByKey(driverId, requestKey) {
   if (!requestKey || !dispatchTableAvailable('delivery_attempts') || !dispatchTableAvailable(ATTEMPT_KEY_COLUMN)) return null;
   try {
-    const { data, error } = await supabase
-      .from('delivery_attempts')
-      .select(DELIVERY_ATTEMPT_COLUMNS)
-      .eq('driver_id', driverId)
-      .eq('client_request_id', requestKey)
-      .order('attempted_at', { ascending: true })
-      .limit(1);
+    const { data, error } = await driverStore.findDeliveryAttemptByKey(driverId, requestKey);
     if (markDispatchTableResult('delivery_attempts', error, DELIVERY_RECORDS_MIGRATION_FILE)) return null;
     if (markAttemptKeyColumnResult(error)) return null;
     if (error) throw error;
-    return data?.[0] || null;
+    return data || null;
   } catch (error) {
     logError('Delivery attempt key lookup failed', error);
     return null;
@@ -2333,21 +2334,10 @@ async function insertDeliveryAttempt(row) {
 async function listDeliveryAttempts({ date, driverId, outcome }) {
   if (!dispatchTableAvailable('delivery_attempts')) throw deliveryRecordsUnavailableError();
   const { start, end } = dubaiDayRange(date);
-  const runQuery = (columns) => {
-    let query = supabase
-      .from('delivery_attempts')
-      .select(columns)
-      .gte('attempted_at', start)
-      .lt('attempted_at', end)
-      .order('attempted_at', { ascending: true })
-      .limit(2000);
-    if (driverId) query = query.eq('driver_id', driverId);
-    if (outcome) query = query.eq('outcome', outcome);
-    return query;
-  };
+  const runQuery = (withKey) => driverStore.listDeliveryAttempts({ start, end, driverId, outcome, withKey });
   const withKey = dispatchTableAvailable(ATTEMPT_KEY_COLUMN);
-  let { data, error } = await runQuery(withKey ? `${DELIVERY_ATTEMPT_COLUMNS}, client_request_id` : DELIVERY_ATTEMPT_COLUMNS);
-  if (withKey && markAttemptKeyColumnResult(error)) ({ data, error } = await runQuery(DELIVERY_ATTEMPT_COLUMNS));
+  let { data, error } = await runQuery(withKey);
+  if (withKey && markAttemptKeyColumnResult(error)) ({ data, error } = await runQuery(false));
   if (markDispatchTableResult('delivery_attempts', error, DELIVERY_RECORDS_MIGRATION_FILE)) throw deliveryRecordsUnavailableError();
   if (error) throw error;
   return dedupeDeliveryAttempts(data || []);
@@ -2361,6 +2351,22 @@ async function loadFailedAttemptsForDriver(driverId, date) {
   } catch (error) {
     if (!error?.isDeliveryRecordsUnavailable) logError('Failed delivery lookup failed', error);
     return [];
+  }
+}
+
+// Buckets whose files may be fetched through /api/files/:bucket/download (signed links).
+const SIGNED_FILE_BUCKETS = new Set([DELIVERY_PROOF_BUCKET, DRIVER_CUSTOMER_REQUEST_BUCKET]);
+
+// { bucket, path } as stored; with the disk file store also a signed download url, because
+// those files are not reachable anywhere else. Supabase mode responses are unchanged.
+function fileReference(bucket, objectPath) {
+  const reference = { bucket, path: objectPath };
+  if (driverFiles.kind !== 'disk' || !SIGNED_FILE_BUCKETS.has(bucket)) return reference;
+  try {
+    const url = driverFiles.signedUrl(bucket, objectPath);
+    return url ? { ...reference, url } : reference;
+  } catch {
+    return reference;
   }
 }
 
@@ -2379,33 +2385,19 @@ function mapDeliveryAttemptRecord(record) {
     cardAmount: Number(record.card_amount || 0),
     cardReference: record.card_reference || null,
     emptyBottlesReturned: Number(record.empty_bottles_returned || 0),
-    proof: record.proof_path ? { bucket: record.proof_bucket, path: record.proof_path } : null,
-    signature: record.signature_path ? { bucket: record.signature_bucket, path: record.signature_path } : null,
+    proof: record.proof_path ? fileReference(record.proof_bucket, record.proof_path) : null,
+    signature: record.signature_path ? fileReference(record.signature_bucket, record.signature_path) : null,
     latitude: finiteOrNull(record.latitude),
     longitude: finiteOrNull(record.longitude),
     attemptedAt: record.attempted_at,
   };
 }
 
-let invoiceBucketPromise;
-async function ensureInvoiceBucket() {
-  if (!invoiceBucketPromise) {
-    invoiceBucketPromise = (async () => {
-      const { data, error } = await supabase.storage.getBucket(INVOICE_BUCKET);
-      if (data && !error) return;
-      const { error: createError } = await supabase.storage.createBucket(INVOICE_BUCKET, {
-        public: false,
-        fileSizeLimit: 5 * 1024 * 1024,
-        allowedMimeTypes: ['application/pdf'],
-      });
-      const alreadyExists = /already exists|duplicate/i.test(String(createError?.message || ''));
-      if (createError && !alreadyExists) throw createError;
-    })().catch((error) => {
-      invoiceBucketPromise = undefined;
-      throw error;
-    });
-  }
-  return invoiceBucketPromise;
+function ensureInvoiceBucket() {
+  return driverFiles.ensureBucket(INVOICE_BUCKET, {
+    fileSizeLimit: 5 * 1024 * 1024,
+    allowedMimeTypes: ['application/pdf'],
+  });
 }
 
 // { invoiceNumber, url, shareText }: the completion response and the per-delivery endpoint.
@@ -2443,9 +2435,7 @@ function mapInvoiceRecord(record) {
 
 async function findInvoiceByOrder(orderId, driverId) {
   if (!dispatchTableAvailable('invoices')) throw deliveryRecordsUnavailableError();
-  let query = supabase.from('invoices').select(INVOICE_COLUMNS).eq('order_id', orderId);
-  if (driverId) query = query.eq('driver_id', driverId);
-  const { data, error } = await query.maybeSingle();
+  const { data, error } = await driverStore.findInvoiceByOrder(orderId, driverId);
   if (markDispatchTableResult('invoices', error, DELIVERY_RECORDS_MIGRATION_FILE)) throw deliveryRecordsUnavailableError();
   if (error) throw error;
   return data || null;
@@ -2454,15 +2444,7 @@ async function findInvoiceByOrder(orderId, driverId) {
 async function listInvoices({ date, driverId }) {
   if (!dispatchTableAvailable('invoices')) throw deliveryRecordsUnavailableError();
   const { start, end } = dubaiDayRange(date);
-  let query = supabase
-    .from('invoices')
-    .select(INVOICE_COLUMNS)
-    .gte('issued_at', start)
-    .lt('issued_at', end)
-    .order('issued_at', { ascending: true })
-    .limit(2000);
-  if (driverId) query = query.eq('driver_id', driverId);
-  const { data, error } = await query;
+  const { data, error } = await driverStore.listInvoices({ start, end, driverId });
   if (markDispatchTableResult('invoices', error, DELIVERY_RECORDS_MIGRATION_FILE)) throw deliveryRecordsUnavailableError();
   if (error) throw error;
   return (data || []).map(mapInvoiceRecord);
@@ -2472,18 +2454,12 @@ async function storeInvoicePdf(record, pdf) {
   await ensureInvoiceBucket();
   const year = String(record.invoice_number).match(/^INV-(\d{4})-/)?.[1] || String(new Date(record.issued_at).getUTCFullYear());
   const path = `${year}/${String(record.invoice_number).replace(/[^A-Za-z0-9._-]/g, '_')}.pdf`;
-  const { error } = await supabase.storage.from(INVOICE_BUCKET).upload(path, pdf, {
+  await driverFiles.upload(INVOICE_BUCKET, path, pdf, {
     contentType: 'application/pdf',
     cacheControl: '0',
     upsert: true,
   });
-  if (error) throw error;
-  const { data, error: updateError } = await supabase
-    .from('invoices')
-    .update({ pdf_bucket: INVOICE_BUCKET, pdf_path: path })
-    .eq('id', record.id)
-    .select(INVOICE_COLUMNS)
-    .single();
+  const { data, error: updateError } = await driverStore.setInvoicePdf(record.id, INVOICE_BUCKET, path);
   if (updateError) throw updateError;
   return data;
 }
@@ -2516,32 +2492,28 @@ async function issueDeliveryInvoice({ orderId, source, stop, driver, paymentMeth
       vatMode: source === 'website' ? 'inclusive' : 'added',
       vatAmount,
     });
-    const { data: invoiceNumber, error: numberError } = await supabase.rpc('next_invoice_number');
+    const { data: invoiceNumber, error: numberError } = await driverStore.nextInvoiceNumber();
     if (markDispatchTableResult('invoices', numberError, DELIVERY_RECORDS_MIGRATION_FILE)) return null;
     if (numberError) throw numberError;
     if (typeof invoiceNumber !== 'string' || !invoiceNumber) throw new Error('next_invoice_number() returned no number');
 
-    const { data: inserted, error: insertError } = await supabase
-      .from('invoices')
-      .insert({
-        invoice_number: invoiceNumber,
-        order_id: orderId,
-        order_source: source,
-        driver_id: driver.id,
-        customer_name: stop.customerName || null,
-        customer_phone: stop.customerPhone || null,
-        customer_address: stop.address || null,
-        items: totals.items,
-        subtotal_excl_vat: totals.subtotal_excl_vat,
-        vat_amount: totals.vat_amount,
-        total_incl_vat: totals.total_incl_vat,
-        currency: 'AED',
-        payment_method: paymentMethod,
-        amount_paid: paymentMethod === 'prepaid' ? totals.total_incl_vat : amountPaid,
-        issued_at: issuedAt,
-      })
-      .select(INVOICE_COLUMNS)
-      .single();
+    const { data: inserted, error: insertError } = await driverStore.insertInvoice({
+      invoice_number: invoiceNumber,
+      order_id: orderId,
+      order_source: source,
+      driver_id: driver.id,
+      customer_name: stop.customerName || null,
+      customer_phone: stop.customerPhone || null,
+      customer_address: stop.address || null,
+      items: totals.items,
+      subtotal_excl_vat: totals.subtotal_excl_vat,
+      vat_amount: totals.vat_amount,
+      total_incl_vat: totals.total_incl_vat,
+      currency: 'AED',
+      payment_method: paymentMethod,
+      amount_paid: paymentMethod === 'prepaid' ? totals.total_incl_vat : amountPaid,
+      issued_at: issuedAt,
+    });
     if (markDispatchTableResult('invoices', insertError, DELIVERY_RECORDS_MIGRATION_FILE)) return null;
     if (insertError?.code === '23505') {
       // A concurrent completion won the unique(order_id) race; its invoice is the invoice.
@@ -2637,10 +2609,12 @@ async function finishDriverDayRecord(req, stop, completion) {
     .map((attempt) => attempt.orderId));
   const [plannedRoute, assignedOrders, remainingDispatchPlan] = await Promise.all([
     getConfiguredDriverRoute(req.authUser.id).catch(() => []),
-    supabase.from('orders')
-      .select('id')
-      .eq('assigned_driver_id', req.authUser.id)
-      .in('status', ['PENDING', 'OUT_FOR_DELIVERY']),
+    supabase
+      ? supabase.from('orders')
+        .select('id')
+        .eq('assigned_driver_id', req.authUser.id)
+        .in('status', ['PENDING', 'OUT_FOR_DELIVERY'])
+      : NO_OPERATIONS_ORDERS,
     hasRemainingPlannedStops(req.authUser.id, normalizeOrderId(stop?.orderId ?? stop?.id), failedOrderIds),
   ]);
   const remainingRoute = plannedRoute.filter((routeStop) => !failedOrderIds.has(normalizeOrderId(routeStop.orderId ?? routeStop.id)));
@@ -2766,10 +2740,10 @@ app.post('/api/driver/deliveries/:orderId/complete', sensitiveRateLimit, require
       const websiteResult = await websiteResponse.json().catch(() => ({}));
       if (!websiteResponse.ok) throw validationError(websiteResult.error || 'Could not complete website delivery');
       if (websiteResult.alreadyCompleted) {
-        await supabase.storage.from(storedProof.bucket).remove([storedProof.path]);
+        await driverFiles.remove(storedProof.bucket, [storedProof.path]);
         storedProof = null;
         if (storedSignature) {
-          await supabase.storage.from(storedSignature.bucket).remove([storedSignature.path]).catch(() => {});
+          await driverFiles.remove(storedSignature.bucket, [storedSignature.path]).catch(() => {});
           storedSignature = null;
         }
       }
@@ -2809,6 +2783,8 @@ app.post('/api/driver/deliveries/:orderId/complete', sensitiveRateLimit, require
       });
     }
 
+    // Operations orders live in Supabase; without it there are none to complete.
+    if (!supabase) return res.status(404).json({ error: 'Order not found' });
     const { data: currentOrder, error: lookupError } = await supabase
       .from('orders')
       .select('id, status, total_amount, payment_method, payment_status, notes')
@@ -2922,10 +2898,10 @@ app.post('/api/driver/deliveries/:orderId/complete', sensitiveRateLimit, require
     });
   } catch (error) {
     if (storedProof?.path) {
-      await supabase.storage.from(storedProof.bucket).remove([storedProof.path]).catch(() => {});
+      await driverFiles.remove(storedProof.bucket, [storedProof.path]).catch(() => {});
     }
     if (storedSignature?.path) {
-      await supabase.storage.from(storedSignature.bucket).remove([storedSignature.path]).catch(() => {});
+      await driverFiles.remove(storedSignature.bucket, [storedSignature.path]).catch(() => {});
     }
     logError('Driver completion error', error);
     res.status(error?.isValidationError ? 400 : 500).json({ error: getPublicErrorMessage(error, 'Could not complete delivery') });
@@ -2964,6 +2940,7 @@ app.post('/api/driver/deliveries/:orderId/fail', sensitiveRateLimit, requireDriv
     }
 
     if (assignment.source === 'operations') {
+      if (!supabase) return res.status(404).json({ error: 'Order not found' });
       const { data: currentOrder, error: lookupError } = await supabase
         .from('orders')
         .select('id, status')
@@ -3003,7 +2980,7 @@ app.post('/api/driver/deliveries/:orderId/fail', sensitiveRateLimit, requireDriv
       // A concurrent request with the same key won the insert; its attempt is the result.
       const raced = await findDeliveryAttemptByKey(req.authUser.id, requestKey);
       if (raced) {
-        if (storedProof?.path) await supabase.storage.from(storedProof.bucket).remove([storedProof.path]).catch(() => {});
+        if (storedProof?.path) await driverFiles.remove(storedProof.bucket, [storedProof.path]).catch(() => {});
         storedProof = null;
         if (!isReplayOf(raced, orderId, 'FAILED')) return sendIdempotencyKeyReused(res);
         return res.status(201).json(failureResult(raced));
@@ -3025,7 +3002,7 @@ app.post('/api/driver/deliveries/:orderId/fail', sensitiveRateLimit, requireDriv
     return res.status(201).json({ orderId, outcome: 'FAILED', reasonCode: failure.reasonCode, attemptedAt });
   } catch (error) {
     if (storedProof?.path) {
-      await supabase.storage.from(storedProof.bucket).remove([storedProof.path]).catch(() => {});
+      await driverFiles.remove(storedProof.bucket, [storedProof.path]).catch(() => {});
     }
     return sendDeliveryRecordError(res, error, 'Driver failed delivery error', 'Could not record failed delivery');
   }
@@ -3083,15 +3060,14 @@ app.get('/api/invoices/:invoiceId/download', async (req, res) => {
   }
   try {
     if (!dispatchTableAvailable('invoices')) throw deliveryRecordsUnavailableError();
-    const { data: record, error } = await supabase.from('invoices').select(INVOICE_COLUMNS).eq('id', invoiceId).maybeSingle();
+    const { data: record, error } = await driverStore.findInvoiceById(invoiceId);
     if (markDispatchTableResult('invoices', error, DELIVERY_RECORDS_MIGRATION_FILE)) throw deliveryRecordsUnavailableError();
     if (error) throw error;
     if (!record) return res.status(404).json({ error: 'Invoice not found' });
 
     let bytes;
     if (record.pdf_bucket && record.pdf_path) {
-      const { data, error: downloadError } = await supabase.storage.from(record.pdf_bucket).download(record.pdf_path);
-      if (!downloadError && data) bytes = Buffer.from(await data.arrayBuffer());
+      bytes = await driverFiles.download(record.pdf_bucket, record.pdf_path).catch(() => null);
     }
     if (!bytes) {
       // No stored PDF (upload failed at completion): render now and store it in the background.
@@ -3181,6 +3157,30 @@ app.get('/api/driver/reports/:reportId/download', async (req, res) => {
   }
 });
 
+// Proof photos, signatures and customer-request files kept by the disk file store. Only
+// reachable with an HMAC-signed link (fileReference); Supabase Storage mode answers 404.
+app.get('/api/files/:bucket/download', async (req, res) => {
+  const bucket = String(req.params.bucket || '');
+  const objectPath = String(req.query.path || '');
+  if (driverFiles.kind !== 'disk' || !SIGNED_FILE_BUCKETS.has(bucket)) return res.status(404).json({ error: 'File not found' });
+  if (!driverFiles.verifySignedUrl(bucket, objectPath, req.query.expires, req.query.signature)) {
+    return res.status(403).json({ error: 'This file link is invalid or has expired' });
+  }
+  try {
+    const bytes = await driverFiles.download(bucket, objectPath);
+    if (!bytes) return res.status(404).json({ error: 'File not found' });
+    const fileName = objectPath.split('/').pop().replace(/[^A-Za-z0-9._-]+/g, '-');
+    res.setHeader('Content-Type', driverFiles.contentType(objectPath));
+    res.setHeader('Content-Length', bytes.length);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('Content-Disposition', `inline; filename="${fileName}"`);
+    return res.send(bytes);
+  } catch (error) {
+    logError('File download error', error);
+    return res.status(500).json({ error: 'Could not download file' });
+  }
+});
+
 app.get('/api/admin/driver-reports', requireDispatchReadOnly, async (_req, res) => {
   try {
     res.json(await driverReports.listReports());
@@ -3190,7 +3190,7 @@ app.get('/api/admin/driver-reports', requireDispatchReadOnly, async (_req, res) 
   }
 });
 
-app.patch('/api/subscriptions/:id', sensitiveRateLimit, requireCustomerAuth, async (req, res) => {
+app.patch('/api/subscriptions/:id', requireSupabase, sensitiveRateLimit, requireCustomerAuth, async (req, res) => {
   if (!UUID_RE.test(req.params.id)) return res.status(400).json({ error: 'Invalid subscription id' });
 
   const updates = {};
@@ -3229,7 +3229,7 @@ app.patch('/api/subscriptions/:id', sensitiveRateLimit, requireCustomerAuth, asy
 });
 
 // --- Wallet & Credits ---
-app.post('/api/users/:id/wallet/topup', paymentRateLimit, requireCustomerAuth, async (req, res) => {
+app.post('/api/users/:id/wallet/topup', requireSupabase, paymentRateLimit, requireCustomerAuth, async (req, res) => {
   if (IS_PRODUCTION) {
     return res.status(501).json({ error: 'Direct wallet top-up is disabled in production. Use the payment gateway flow.' });
   }
@@ -3257,7 +3257,7 @@ app.post('/api/users/:id/wallet/topup', paymentRateLimit, requireCustomerAuth, a
 });
 
 // Buy 5-gallon coupon pack from wallet balance. Internal DB field remains bottle_credits for compatibility.
-app.post('/api/users/:id/wallet/buy-credits', paymentRateLimit, requireCustomerAuth, async (req, res) => {
+app.post('/api/users/:id/wallet/buy-credits', requireSupabase, paymentRateLimit, requireCustomerAuth, async (req, res) => {
   if (!UUID_RE.test(req.params.id)) return res.status(400).json({ error: 'Invalid user id' });
   if (!requireSameCustomer(req, res, req.params.id)) return;
 
@@ -3299,7 +3299,7 @@ app.post('/api/users/:id/wallet/buy-credits', paymentRateLimit, requireCustomerA
 });
 
 // --- Push Notifications ---
-app.post('/api/notifications/register-token', sensitiveRateLimit, async (req, res) => {
+app.post('/api/notifications/register-token', requireSupabase, sensitiveRateLimit, async (req, res) => {
   const token = String(req.body?.token || '').trim();
   const platform = normalizePushPlatform(req.body?.platform);
   const appType = normalizeAppType(req.body?.appType);
@@ -3355,7 +3355,7 @@ app.post('/api/notifications/register-token', sensitiveRateLimit, async (req, re
   }
 });
 
-app.post('/api/notifications/unregister-token', sensitiveRateLimit, async (req, res) => {
+app.post('/api/notifications/unregister-token', requireSupabase, sensitiveRateLimit, async (req, res) => {
   const token = String(req.body?.token || '').trim();
   const bearerToken = getBearerToken(req);
 
@@ -3389,7 +3389,7 @@ app.post('/api/notifications/unregister-token', sensitiveRateLimit, async (req, 
   }
 });
 
-app.get('/api/notifications/history', requireCustomerAuth, async (req, res) => {
+app.get('/api/notifications/history', requireSupabase, requireCustomerAuth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('notification_recipients')
@@ -3404,7 +3404,7 @@ app.get('/api/notifications/history', requireCustomerAuth, async (req, res) => {
   }
 });
 
-app.post('/api/admin/notifications/send', requireAdmin, async (req, res) => {
+app.post('/api/admin/notifications/send', requireSupabase, requireAdmin, async (req, res) => {
   const title = truncateText(req.body?.title, 100);
   const body = truncateText(req.body?.body, 220);
   const audience = String(req.body?.audience || 'all');
@@ -3440,7 +3440,7 @@ app.post('/api/admin/notifications/send', requireAdmin, async (req, res) => {
   }
 });
 
-app.get('/api/admin/notifications/history', requireAdmin, async (_req, res) => {
+app.get('/api/admin/notifications/history', requireSupabase, requireAdmin, async (_req, res) => {
   try {
     const { data, error } = await supabase
       .from('notification_logs')
@@ -3673,6 +3673,7 @@ async function sendPushToTokens(tokenRows, payload, logId = null) {
 }
 
 async function sendPushToUsers(userIds, payload, appType = null) {
+  if (!supabase) return { sentCount: 0, failedCount: 0 };
   const tokens = await fetchActivePushTokensForUsers(userIds, appType);
   return sendPushToTokens(tokens, payload);
 }
@@ -3682,6 +3683,7 @@ async function sendPushToUser(userId, payload, appType = null) {
 }
 
 async function sendPushToAudience(audience, payload, userIds = [], logId = null) {
+  if (!supabase) return { sentCount: 0, failedCount: 0 };
   const tokens = await fetchActivePushTokensForAudience(audience, userIds);
   return sendPushToTokens(tokens, payload, logId);
 }
@@ -3723,7 +3725,7 @@ async function markPaymentTransaction(reference, status, fields = {}) {
 }
 
 // --- Network International (N-Genius) Payment Gateway ---
-app.post('/api/payment/ngenius/topup', paymentRateLimit, requireCustomerAuth, async (req, res) => {
+app.post('/api/payment/ngenius/topup', requireSupabase, paymentRateLimit, requireCustomerAuth, async (req, res) => {
   const { amount, userId: requestedUserId } = req.body;
   const userId = requireSameCustomer(req, res, requestedUserId);
   if (!userId) return;
@@ -3751,7 +3753,7 @@ app.post('/api/payment/ngenius/topup', paymentRateLimit, requireCustomerAuth, as
   }
 });
 
-app.post('/api/payment/ngenius/topup/confirm', paymentRateLimit, requireCustomerAuth, async (req, res) => {
+app.post('/api/payment/ngenius/topup/confirm', requireSupabase, paymentRateLimit, requireCustomerAuth, async (req, res) => {
   const { amount, userId: requestedUserId, orderRef } = req.body;
   const userId = requireSameCustomer(req, res, requestedUserId);
   if (!userId) return;
@@ -3818,7 +3820,7 @@ app.post('/api/payment/ngenius/topup/confirm', paymentRateLimit, requireCustomer
 });
 
 // --- Orders (Backend Admin/Customer fallback) ---
-app.post('/api/payment/ngenius/checkout', paymentRateLimit, requireCustomerAuth, async (req, res) => {
+app.post('/api/payment/ngenius/checkout', requireSupabase, paymentRateLimit, requireCustomerAuth, async (req, res) => {
   const { amount, userId: requestedUserId, orderPayload } = req.body;
   const userId = requireSameCustomer(req, res, requestedUserId);
   if (!userId) return;
@@ -3854,7 +3856,7 @@ app.post('/api/payment/ngenius/checkout', paymentRateLimit, requireCustomerAuth,
   }
 });
 
-app.post('/api/payment/ngenius/checkout/confirm', paymentRateLimit, requireCustomerAuth, async (req, res) => {
+app.post('/api/payment/ngenius/checkout/confirm', requireSupabase, paymentRateLimit, requireCustomerAuth, async (req, res) => {
   const { amount, userId: requestedUserId, orderRef, orderPayload } = req.body;
   const userId = requireSameCustomer(req, res, requestedUserId);
   if (!userId) return;
@@ -4051,23 +4053,30 @@ function isNGeniusPaymentPaid(paymentStatus) {
 // --- Admin: Drivers ---
 app.get('/api/admin/dispatch/overview', requireDispatchReadOnly, async (req, res) => {
   try {
+    // Without Supabase: configured drivers only, and no operations orders / customers.
     const [authUsers, driversResult, ordersResult, customersResult] = await Promise.all([
       listAllAuthUsers(),
       supabase
-        .from('users')
-        .select('id, name, email, address, building, apartment, city, location_lat, location_lng')
-        .eq('role', 'DRIVER')
-        .order('name'),
+        ? supabase
+          .from('users')
+          .select('id, name, email, address, building, apartment, city, location_lat, location_lng')
+          .eq('role', 'DRIVER')
+          .order('name')
+        : NO_OPERATIONS_ORDERS,
       supabase
-        .from('orders')
-        .select('*, user:users(name, email, address, building, apartment, city, location_lat, location_lng)')
-        .in('status', ['PENDING', 'OUT_FOR_DELIVERY'])
-        .order('created_at', { ascending: true }),
+        ? supabase
+          .from('orders')
+          .select('*, user:users(name, email, address, building, apartment, city, location_lat, location_lng)')
+          .in('status', ['PENDING', 'OUT_FOR_DELIVERY'])
+          .order('created_at', { ascending: true })
+        : NO_OPERATIONS_ORDERS,
       supabase
-        .from('users')
-        .select('id, name, email, address, building, apartment, city, location_lat, location_lng, created_at')
-        .eq('role', 'CUSTOMER')
-        .order('created_at', { ascending: false }),
+        ? supabase
+          .from('users')
+          .select('id, name, email, address, building, apartment, city, location_lat, location_lng, created_at')
+          .eq('role', 'CUSTOMER')
+          .order('created_at', { ascending: false })
+        : NO_OPERATIONS_ORDERS,
     ]);
 
     if (driversResult.error) throw driversResult.error;
@@ -4194,7 +4203,7 @@ async function findDispatchDriver(driverId) {
   if (!/^[A-Za-z0-9._:-]{1,80}$/.test(driverId)) return null;
   const configuredDriver = CONFIGURED_DRIVERS.find((driver) => driver.id === driverId);
   if (configuredDriver) return { id: configuredDriver.id, name: configuredDriver.name };
-  if (!UUID_RE.test(driverId)) return null;
+  if (!UUID_RE.test(driverId) || !supabase) return null;
 
   const { data, error } = await supabase
     .from('users')
@@ -4241,28 +4250,21 @@ app.put('/api/admin/drivers/:driverId/route-plan', requireOperationsAccess, asyn
     const otherPlanUpdates = removeOrdersFromOtherPlans(existingPlans, driverId, orderIds);
     const updatedAt = new Date().toISOString();
     for (const update of otherPlanUpdates) {
-      const query = update.orderIds.length
-        ? supabase
-          .from('driver_route_plans')
-          .update({ order_ids: update.orderIds, updated_at: updatedAt })
-        : supabase.from('driver_route_plans').delete();
-      const { error } = await query.eq('driver_id', update.driverId).eq('plan_date', date);
+      const { error } = update.orderIds.length
+        ? await driverStore.updateRoutePlanOrders(update.driverId, date, update.orderIds, updatedAt)
+        : await driverStore.deleteRoutePlan(update.driverId, date);
       if (markDispatchTableResult('driver_route_plans', error)) throw routePlansUnavailableError();
       if (error) throw error;
     }
 
-    const { data, error } = await supabase
-      .from('driver_route_plans')
-      .upsert({
-        driver_id: driverId,
-        plan_date: date,
-        order_ids: orderIds,
-        source: truncateText(req.body?.source, 40) || 'dispatch-console',
-        created_by: truncateText(req.body?.createdBy, 120) || null,
-        updated_at: updatedAt,
-      }, { onConflict: 'driver_id,plan_date' })
-      .select(ROUTE_PLAN_COLUMNS)
-      .single();
+    const { data, error } = await driverStore.upsertRoutePlan({
+      driver_id: driverId,
+      plan_date: date,
+      order_ids: orderIds,
+      source: truncateText(req.body?.source, 40) || 'dispatch-console',
+      created_by: truncateText(req.body?.createdBy, 120) || null,
+      updated_at: updatedAt,
+    });
     if (markDispatchTableResult('driver_route_plans', error)) throw routePlansUnavailableError();
     if (error) throw error;
 
@@ -4285,12 +4287,7 @@ app.delete('/api/admin/drivers/:driverId/route-plan', requireOperationsAccess, a
   if (dateError) return res.status(400).json({ error: dateError });
 
   try {
-    const { data, error } = await supabase
-      .from('driver_route_plans')
-      .delete()
-      .eq('driver_id', driverId)
-      .eq('plan_date', date)
-      .select('driver_id');
+    const { data, error } = await driverStore.deleteRoutePlan(driverId, date);
     if (markDispatchTableResult('driver_route_plans', error)) throw routePlansUnavailableError();
     if (error) throw error;
     res.json({ driverId, date, deleted: (data || []).length > 0 });
@@ -4299,7 +4296,7 @@ app.delete('/api/admin/drivers/:driverId/route-plan', requireOperationsAccess, a
   }
 });
 
-app.get('/api/admin/drivers', requireAdmin, async (req, res) => {
+app.get('/api/admin/drivers', requireSupabase, requireAdmin, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('users')
@@ -4313,7 +4310,7 @@ app.get('/api/admin/drivers', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/orders/:id/assign', requireAdmin, async (req, res) => {
+app.post('/api/admin/orders/:id/assign', requireSupabase, requireAdmin, async (req, res) => {
   const { driverId } = req.body;
   if (!driverId) return res.status(400).json({ error: 'driverId required' });
 
@@ -4341,7 +4338,7 @@ app.post('/api/admin/orders/:id/assign', requireAdmin, async (req, res) => {
 });
 
 // --- Admin Endpoints ---
-app.get('/api/admin/metrics', requireAdmin, async (req, res) => {
+app.get('/api/admin/metrics', requireSupabase, requireAdmin, async (req, res) => {
   try {
     const [ordersResult, customersResult, deliveriesResult] = await Promise.all([
       supabase.from('orders').select('total_amount, status', { count: 'exact' }),
@@ -4374,7 +4371,7 @@ app.get('/api/admin/metrics', requireAdmin, async (req, res) => {
   }
 });
 
-app.get('/api/admin/orders', requireOperationsAccess, async (req, res) => {
+app.get('/api/admin/orders', requireSupabase, requireOperationsAccess, async (req, res) => {
   try {
     const [authUsersResult, ordersResult] = await Promise.all([
       listAllAuthUsers(),
@@ -4450,7 +4447,7 @@ app.get('/api/admin/orders', requireOperationsAccess, async (req, res) => {
   }
 });
 
-app.put('/api/admin/orders/:id/status', requireOperationsAccess, async (req, res) => {
+app.put('/api/admin/orders/:id/status', requireSupabase, requireOperationsAccess, async (req, res) => {
   const { status } = req.body;
   // Normalize status to uppercase for backend consistency
   const normalizedStatus = status ? status.toUpperCase() : 'PENDING';
@@ -4486,7 +4483,7 @@ app.put('/api/admin/orders/:id/status', requireOperationsAccess, async (req, res
 });
 
 // Admin: Get all customers
-app.get('/api/admin/customers', requireAdmin, async (req, res) => {
+app.get('/api/admin/customers', requireSupabase, requireAdmin, async (req, res) => {
   try {
     const [authUsers, usersResult, ordersResult] = await Promise.all([
       listAllAuthUsers(),

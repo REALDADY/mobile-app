@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const PDFDocument = require('pdfkit');
 const { computeDaySummary } = require('./day-summary-service');
+const { createSupabaseFileStore } = require('./store/files-supabase');
 
 const DEFAULT_BUCKET = 'driver-day-reports';
 const INDEX_PATH = 'reports-index.json';
@@ -31,9 +32,10 @@ function upsertJournalFailure(journal, exception) {
   return true;
 }
 
-function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket = DEFAULT_BUCKET }) {
+// files: a store from ./store (disk or Supabase Storage); { supabase } alone keeps working.
+function createDriverReportService({ files, supabase, apiBaseUrl, signingSecret, bucket = DEFAULT_BUCKET }) {
+  const fileStore = files || createSupabaseFileStore(supabase);
   const locks = new Map();
-  let bucketPromise;
 
   function withLock(key, operation) {
     const previous = locks.get(key) || Promise.resolve();
@@ -67,31 +69,19 @@ function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket
     return `reports/${String(driverId).replace(/[^A-Za-z0-9-]/g, '_')}/${reportDate}.pdf`;
   }
 
-  async function ensureBucket() {
-    if (!bucketPromise) {
-      bucketPromise = (async () => {
-        const { data, error } = await supabase.storage.getBucket(bucket);
-        if (data && !error) return;
-        const { error: createError } = await supabase.storage.createBucket(bucket, {
-          public: false,
-          fileSizeLimit: 10 * 1024 * 1024,
-          allowedMimeTypes: ['application/json', 'application/pdf'],
-        });
-        if (createError && !/already exists|duplicate/i.test(String(createError.message || ''))) throw createError;
-      })().catch((error) => {
-        bucketPromise = undefined;
-        throw error;
-      });
-    }
-    return bucketPromise;
+  function ensureBucket() {
+    return fileStore.ensureBucket(bucket, {
+      fileSizeLimit: 10 * 1024 * 1024,
+      allowedMimeTypes: ['application/json', 'application/pdf'],
+    });
   }
 
   async function readJson(path, fallback) {
     await ensureBucket();
-    const { data, error } = await supabase.storage.from(bucket).download(path);
-    if (error || !data) return structuredClone(fallback);
+    const bytes = await fileStore.download(bucket, path);
+    if (!bytes) return structuredClone(fallback);
     try {
-      return JSON.parse(await data.text());
+      return JSON.parse(bytes.toString('utf8'));
     } catch {
       return structuredClone(fallback);
     }
@@ -100,12 +90,11 @@ function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket
   async function writeJson(path, value) {
     await ensureBucket();
     const payload = Buffer.from(JSON.stringify(value, null, 2));
-    const { error } = await supabase.storage.from(bucket).upload(path, payload, {
+    await fileStore.upload(bucket, path, payload, {
       contentType: 'application/json',
       cacheControl: '0',
       upsert: true,
     });
-    if (error) throw error;
   }
 
   function emptyJournal(driver, reportDate) {
@@ -524,12 +513,11 @@ function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket
       const summary = computeDaySummary({ journal });
       const pdf = await drawReport(reportJournal, generatedAt, summary);
       const objectPath = pdfPath(driver.id, reportDate);
-      const { error } = await supabase.storage.from(bucket).upload(objectPath, pdf, {
+      await fileStore.upload(bucket, objectPath, pdf, {
         contentType: 'application/pdf',
         cacheControl: '0',
         upsert: true,
       });
-      if (error) throw error;
 
       const metadata = {
         id: reportId(driver.id, reportDate),
@@ -570,9 +558,9 @@ function createDriverReportService({ supabase, apiBaseUrl, signingSecret, bucket
     const index = await readIndex();
     const metadata = index.reports.find((report) => report.id === id);
     if (!metadata) return null;
-    const { data, error } = await supabase.storage.from(bucket).download(metadata.objectPath);
-    if (error || !data) return null;
-    return { metadata, bytes: Buffer.from(await data.arrayBuffer()) };
+    const bytes = await fileStore.download(bucket, metadata.objectPath);
+    if (!bytes) return null;
+    return { metadata, bytes };
   }
 
   return {

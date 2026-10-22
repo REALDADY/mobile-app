@@ -11,6 +11,8 @@
     "dev": "nodemon src/server.js",
     "check": "node --check src/server.js",
     "check:schema": "node scripts/check-schema.js",
+    "db:apply-driver-schema": "node scripts/apply-driver-schema.js",
+    "db:check-driver-schema": "node scripts/check-driver-schema.js",
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
