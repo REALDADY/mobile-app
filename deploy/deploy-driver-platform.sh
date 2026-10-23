@@ -13,6 +13,7 @@
 #   nginx     driver-api.rswater.ae server block + Let's Encrypt (DNS must point here first)
 #   verify    end-to-end checks
 set -euo pipefail
+export PGCONNECT_TIMEOUT=15   # never hang on a database connection
 
 PHASE="${1:-check}"
 REPO_URL="https://github.com/REALDADY/mobile-app.git"
@@ -75,7 +76,7 @@ check)
   psql "$(session_url)" -Atc "select 1 from pg_roles where rolname='driver_ops'" | grep -q 1 && echo "driver_ops role     : exists" || echo "driver_ops role     : not created yet"
   [[ -d "$APP_DIR/.git" ]] && echo "driver backend      : $APP_DIR ($(git -C "$APP_DIR" rev-parse --short HEAD))" || echo "driver backend      : not installed"
   ss -ltn "sport = :$APP_PORT" | grep -q LISTEN && echo "port $APP_PORT          : IN USE" || echo "port $APP_PORT          : free"
-  getent hosts "$DOMAIN" >/dev/null && echo "DNS $DOMAIN : $(getent hosts "$DOMAIN" | awk '{print $1}')" || echo "DNS $DOMAIN : not resolving yet"
+  timeout 5 getent hosts "$DOMAIN" >/dev/null && echo "DNS $DOMAIN : $(getent hosts "$DOMAIN" | awk '{print $1}')" || echo "DNS $DOMAIN : not resolving yet"
   ;;
 
 backup)
