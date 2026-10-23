@@ -2,7 +2,6 @@ import { Router, Request, Response } from 'express'
 import crypto from 'crypto'
 import { z } from 'zod'
 import pool from '../db/pool'
-import { PROMOTION_ACTIVE_SQL } from '../utils/promotions'
 import { calculateOrder, normalizeEmirateName } from '../utils/orderCalculator'
 import { normalizePhone } from '../utils/phone'
 import { insertOrderRecords, sendNewOrderNotifications } from '../services/createOrder'
@@ -101,7 +100,8 @@ export function mapDispatchPayment(method: DispatchPaymentMethod): { paymentMeth
   switch (method) {
     case 'cash_on_delivery': return { paymentMethod: 'cash_on_delivery', paymentStatus: 'pending' }
     case 'card_on_delivery': return { paymentMethod: 'card_on_delivery', paymentStatus: 'pending' }
-    case 'prepaid':          return { paymentMethod: 'bank_transfer', paymentStatus: 'paid' }
+    // The live orders_payment_method_check has no bank_transfer; 'wallet' + paid is the closest 'already paid'.
+    case 'prepaid':          return { paymentMethod: 'wallet', paymentStatus: 'paid' }
   }
 }
 
@@ -388,7 +388,7 @@ router.get('/overview', async (_req: Request, res: Response) => {
   }
 })
 
-// Same active/promotion filter and ordering as public GET /api/products, minus
+// Same active filter and ordering as public GET /api/products, minus
 // out-of-stock items (calculateOrder refuses them, so customers can't buy them).
 router.get('/products', async (_req: Request, res: Response) => {
   try {
@@ -398,7 +398,6 @@ router.get('/products', async (_req: Request, res: Response) => {
       FROM products p
       LEFT JOIN categories c ON p.category_id = c.id
       WHERE p.is_active = TRUE
-        AND ${PROMOTION_ACTIVE_SQL('p')}
         AND p.stock_status <> 'out_of_stock'
       ORDER BY
         CASE p.stock_status
@@ -646,7 +645,7 @@ router.post('/orders', requireDispatchWrite, async (req: Request, res: Response)
     const productIds = data.items.map((item) => item.productId)
     const productResult = await pool.query(`
       SELECT p.id, p.slug, p.name_en, p.size, p.is_active, p.stock_status, p.restricted_emirates,
-             (${PROMOTION_ACTIVE_SQL('p')}) AS promotion_active
+             TRUE AS promotion_active  -- the live website has no promotion window
       FROM products p
       WHERE p.id::text = ANY($1) OR p.slug = ANY($1)
     `, [productIds])

@@ -114,9 +114,19 @@ website)
   cp "$pkg/createOrder.ts" "$WEBSITE_BACKEND_DIR/src/services/createOrder.ts"
   APP_TS="$WEBSITE_BACKEND_DIR/src/app.ts"
   if ! grep -q "dispatchReadRouter" "$APP_TS"; then
-    grep -q "^// ─── RATE LIMITING" "$APP_TS" || die "could not find the RATE LIMITING marker in app.ts — apply app.ts.edit.md by hand"
-    sed -i "0,/^import .* from '\.\/routes\/[^']*'$/s//&\nimport dispatchReadRouter from '.\/routes\/dispatchRead'/" "$APP_TS"
-    sed -i "s|^// ─── RATE LIMITING|// Driver/dispatch feed: GET is loopback-or-key gated, writes need DISPATCH_WRITE_KEY (or loopback).\napp.use('/api/dispatch', dispatchReadRouter)\n\n&|" "$APP_TS"
+    # CRLF-aware edit: import after the last ./routes/ import, mount just before the RATE LIMITING block.
+    python3 - "$APP_TS" <<'PY' || { restore; die "could not place the dispatch router in app.ts — files restored"; }
+import re, sys
+p = sys.argv[1]; s = open(p, newline='').read()
+nl = '\r\n' if '\r\n' in s else '\n'
+lines = s.split(nl)
+idx = max(i for i, l in enumerate(lines) if re.match(r"^import .* from '\./routes/[^']*'\s*;?\s*$", l))
+lines.insert(idx + 1, "import dispatchReadRouter from './routes/dispatchRead'")
+j = next(i for i, l in enumerate(lines) if l.startswith('// \u2500\u2500\u2500 RATE LIMITING'))
+lines[j:j] = ["// Driver/dispatch feed: GET is loopback-or-key gated, writes need DISPATCH_WRITE_KEY (or loopback).",
+              "app.use('/api/dispatch', dispatchReadRouter)", ""]
+open(p, 'w', newline='').write(nl.join(lines))
+PY
   fi
   grep -n "dispatchRead" "$APP_TS"
   grep -q "trust proxy" "$APP_TS" || die "website app.ts has no 'trust proxy' — public requests could look local; stop"
