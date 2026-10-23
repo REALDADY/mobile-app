@@ -38,6 +38,8 @@ touch "$STATE_FILE"; chmod 600 "$STATE_FILE"
 source "$STATE_FILE"
 remember() { grep -v "^$1=" "$STATE_FILE" > "$STATE_FILE.tmp" || true; printf '%s=%q\n' "$1" "$2" >> "$STATE_FILE.tmp"; mv "$STATE_FILE.tmp" "$STATE_FILE"; chmod 600 "$STATE_FILE"; }
 
+session_url() { printf '%s' "$WEBSITE_DB_URL" | sed -E 's#:6543/#:5432/#'; }
+
 detect_website() {
   # The website backend is whatever PM2 process listens on 127.0.0.1:$WEBSITE_PORT.
   local pid cwd
@@ -54,6 +56,9 @@ detect_website() {
   WEBSITE_BACKEND_DIR="$d"
   WEBSITE_PM2_NAME=$(pm2 jlist 2>/dev/null | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const p=JSON.parse(s||"[]").find(x=>x.pid==process.argv[1]);console.log(p?p.name:"")})' "$pid" || true)
   remember WEBSITE_BACKEND_DIR "$WEBSITE_BACKEND_DIR"
+  WEBSITE_DB_URL=$(grep -h '^DATABASE_URL=' "$WEBSITE_BACKEND_DIR/.env" | head -1 | cut -d= -f2-)
+  [[ -n "$WEBSITE_DB_URL" ]] || die "website .env has no DATABASE_URL"
+  remember WEBSITE_DB_URL "$WEBSITE_DB_URL"
   remember WEBSITE_PM2_NAME "$WEBSITE_PM2_NAME"
 }
 
@@ -66,8 +71,8 @@ check)
   echo "website backend dir : $WEBSITE_BACKEND_DIR"
   echo "website PM2 process : ${WEBSITE_PM2_NAME:-<not found in pm2>}"
   grep -q "dispatchReadRouter" "$WEBSITE_BACKEND_DIR/src/app.ts" && echo "dispatch router     : already mounted" || echo "dispatch router     : not installed yet"
-  sudo -u postgres psql -Atc "select 1 from pg_database where datname='$DB_NAME'" | grep -q 1 && echo "database            : $DB_NAME found" || die "database $DB_NAME not found"
-  sudo -u postgres psql -d "$DB_NAME" -Atc "select 1 from pg_roles where rolname='driver_ops'" | grep -q 1 && echo "driver_ops role     : exists" || echo "driver_ops role     : not created yet"
+  psql "$(session_url)" -Atc "select 'database            : '||current_database()||' on '||split_part(version(),' ',2)" || die "cannot connect to the website database"
+  psql "$(session_url)" -Atc "select 1 from pg_roles where rolname='driver_ops'" | grep -q 1 && echo "driver_ops role     : exists" || echo "driver_ops role     : not created yet"
   [[ -d "$APP_DIR/.git" ]] && echo "driver backend      : $APP_DIR ($(git -C "$APP_DIR" rev-parse --short HEAD))" || echo "driver backend      : not installed"
   ss -ltn "sport = :$APP_PORT" | grep -q LISTEN && echo "port $APP_PORT          : IN USE" || echo "port $APP_PORT          : free"
   getent hosts "$DOMAIN" >/dev/null && echo "DNS $DOMAIN : $(getent hosts "$DOMAIN" | awk '{print $1}')" || echo "DNS $DOMAIN : not resolving yet"
@@ -77,7 +82,7 @@ backup)
   [[ -n "${WEBSITE_BACKEND_DIR:-}" ]] || detect_website
   say "Backups → $BACKUP_DIR"
   mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
-  sudo -u postgres pg_dump -Fc "$DB_NAME" > "$BACKUP_DIR/$DB_NAME.dump"
+  pg_dump --schema-only --no-owner "$(session_url)" > "$BACKUP_DIR/website-db-schema.sql"
   tar --exclude=node_modules -czf "$BACKUP_DIR/website-backend.tgz" -C "$(dirname "$WEBSITE_BACKEND_DIR")" "$(basename "$WEBSITE_BACKEND_DIR")"
   ls -lh "$BACKUP_DIR"
   remember LAST_BACKUP_DIR "$BACKUP_DIR"
@@ -134,22 +139,24 @@ website)
   ;;
 
 database)
-  say "Role + schema driver_ops in $DB_NAME (least privilege)"
-  if ! sudo -u postgres psql -d "$DB_NAME" -Atc "select 1 from pg_roles where rolname='driver_ops'" | grep -q 1; then
+  [[ -n "${WEBSITE_DB_URL:-}" ]] || detect_website
+  say "Role + schema driver_ops in the website database (least privilege)"
+  DBU="$(session_url)"
+  if ! psql "$DBU" -Atc "select 1 from pg_roles where rolname='driver_ops'" | grep -q 1; then
     pw=$(openssl rand -base64 32 | tr -d '/+=' | cut -c1-32)
-    sudo -u postgres psql -d "$DB_NAME" -v ON_ERROR_STOP=1 -v pw="$pw" <<'SQL'
+    psql "$DBU" -v ON_ERROR_STOP=1 -v pw="$pw" <<'SQL'
 create role driver_ops login password :'pw';
 SQL
     remember DRIVER_DB_PASSWORD "$pw"
   fi
-  sudo -u postgres psql -d "$DB_NAME" -v ON_ERROR_STOP=1 <<SQL
-grant connect on database $DB_NAME to driver_ops;
+  psql "$DBU" -v ON_ERROR_STOP=1 <<'SQL'
+grant connect on database postgres to driver_ops;
 create schema if not exists driver_ops authorization driver_ops;
 grant usage, create on schema driver_ops to driver_ops;
 alter role driver_ops set search_path = driver_ops;
 revoke all on schema public from driver_ops;
 SQL
-  sudo -u postgres psql -d "$DB_NAME" -Atc "select 'can read website orders: ' || has_table_privilege('driver_ops','public.orders','select')"
+  psql "$DBU" -Atc "select 'driver_ops can read website orders: ' || has_table_privilege('driver_ops','public.orders','select') || ' · can create in public: ' || has_schema_privilege('driver_ops','public','create')"
   ;;
 
 backend)
@@ -164,12 +171,16 @@ backend)
   if [[ ! -f "$ENVF" ]]; then
     read -r -p "Driver login password (same as DRIVER_LOGIN_PASSWORD on the office PC): " -s dlp; echo
     admin=$(openssl rand -hex 32); drv=$(openssl rand -hex 32); sess=$(openssl rand -hex 48)
+    [[ -n "${WEBSITE_DB_URL:-}" ]] || detect_website
+    # Same Supabase pooler as the website, but logging in as the limited driver_ops role.
+    ddu=$(printf '%s' "$WEBSITE_DB_URL" | sed -E 's#://postgres\.([a-z0-9]+):[^@]*@#://driver_ops.\1:'"$DRIVER_DB_PASSWORD"'@#')
+    [[ "$ddu" == *"://driver_ops."* ]] || die "could not derive the driver_ops database URL from the website DATABASE_URL"
     cat > "$ENVF" <<ENV
 NODE_ENV=production
 PORT=$APP_PORT
 HOST=127.0.0.1
 API_BASE_URL=https://$DOMAIN
-DRIVER_DATABASE_URL=postgresql://driver_ops:$DRIVER_DB_PASSWORD@127.0.0.1:5432/$DB_NAME
+DRIVER_DATABASE_URL=$ddu
 DRIVER_FILES_DIR=$FILES_DIR
 WEBSITE_DISPATCH_URL=http://127.0.0.1:$WEBSITE_PORT/api/dispatch/overview
 WEBSITE_DISPATCH_WRITE_BASE_URL=http://127.0.0.1:$WEBSITE_PORT/api/dispatch
