@@ -182,7 +182,9 @@ backend)
   (cd "$APP_DIR" && npm ci --omit=dev)
   ENVF="$APP_DIR/.env"
   if [[ ! -f "$ENVF" ]]; then
-    read -r -p "Driver login password (same as DRIVER_LOGIN_PASSWORD on the office PC): " -s dlp; echo
+    dlp="${DRIVER_LOGIN_PASSWORD:-}"
+    if [[ -z "$dlp" && -t 0 ]]; then read -r -p "Driver login password (same as DRIVER_LOGIN_PASSWORD on the office PC): " -s dlp; echo; fi
+    [[ -n "$dlp" ]] || die "driver login password missing (pass DRIVER_LOGIN_PASSWORD or run interactively)"
     admin=$(openssl rand -hex 32); drv=$(openssl rand -hex 32); sess=$(openssl rand -hex 48)
     [[ -n "${WEBSITE_DB_URL:-}" ]] || detect_website
     # Same Supabase pooler as the website, but logging in as the limited driver_ops role.
