@@ -162,6 +162,8 @@ SQL
   fi
   psql "$DBU" -v ON_ERROR_STOP=1 <<'SQL'
 grant connect on database postgres to driver_ops;
+-- PostgreSQL 16+: the creator must be able to SET ROLE to the schema owner.
+grant driver_ops to postgres;
 create schema if not exists driver_ops authorization driver_ops;
 grant usage, create on schema driver_ops to driver_ops;
 alter role driver_ops set search_path = driver_ops;
