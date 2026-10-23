@@ -208,7 +208,7 @@ DRIVER_SESSION_SECRET=$sess
 ADMIN_API_KEY=$admin
 DRIVER_API_KEY=$drv
 FRONTEND_ALLOWED_ORIGINS=https://rswater.ae
-INVOICE_COMPANY_NAME=RS Water
+INVOICE_COMPANY_NAME="RS Water"
 ENV
     chmod 600 "$ENVF"
     echo; echo "Console key (put in the office PC's map/.env.local as RSWATER_OPERATIONS_API_KEY and RSWATER_WEBSITE_DISPATCH_KEY):"
