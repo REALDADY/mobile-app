@@ -88,10 +88,24 @@ website)
   [[ -n "${LAST_BACKUP_DIR:-}" ]] || die "run the backup phase first"
   say "Install dispatch router into $WEBSITE_BACKEND_DIR"
   tmp=$(mktemp -d); git clone -q --depth 1 -b "$REPO_BRANCH" "$REPO_URL" "$tmp/repo"
-  src="$tmp/repo/deploy/website-dispatch/dispatchRead.ts"
-  [[ -f "$src" ]] || die "router file missing in repo"
+  pkg="$tmp/repo/deploy/website-dispatch"
+  [[ -f "$pkg/dispatchRead.ts" && -f "$pkg/createOrder.ts" ]] || die "router files missing in repo"
   [[ -f "$WEBSITE_BACKEND_DIR/src/db/pool.ts" || -f "$WEBSITE_BACKEND_DIR/src/db/pool.js" ]] || die "website has no src/db/pool — layout differs from expected, stop"
-  cp "$src" "$WEBSITE_BACKEND_DIR/src/routes/dispatchRead.ts"
+  # Keep copies of every file we touch so a failed type-check can be undone exactly.
+  undo="$tmp/undo"; mkdir -p "$undo"
+  for f in src/routes/dispatchRead.ts src/services/createOrder.ts src/app.ts; do
+    [[ -f "$WEBSITE_BACKEND_DIR/$f" ]] && { mkdir -p "$undo/$(dirname "$f")"; cp -p "$WEBSITE_BACKEND_DIR/$f" "$undo/$f"; }
+  done
+  restore() {
+    for f in src/routes/dispatchRead.ts src/services/createOrder.ts src/app.ts; do
+      if [[ -f "$undo/$f" ]]; then cp -p "$undo/$f" "$WEBSITE_BACKEND_DIR/$f"; else rm -f "$WEBSITE_BACKEND_DIR/$f"; fi
+    done
+  }
+  if [[ -f "$WEBSITE_BACKEND_DIR/src/services/createOrder.ts" ]] && ! cmp -s "$pkg/createOrder.ts" "$WEBSITE_BACKEND_DIR/src/services/createOrder.ts"; then
+    die "the live website already has a different src/services/createOrder.ts — not overwriting it"
+  fi
+  cp "$pkg/dispatchRead.ts" "$WEBSITE_BACKEND_DIR/src/routes/dispatchRead.ts"
+  cp "$pkg/createOrder.ts" "$WEBSITE_BACKEND_DIR/src/services/createOrder.ts"
   APP_TS="$WEBSITE_BACKEND_DIR/src/app.ts"
   if ! grep -q "dispatchReadRouter" "$APP_TS"; then
     grep -q "^// ─── RATE LIMITING" "$APP_TS" || die "could not find the RATE LIMITING marker in app.ts — apply app.ts.edit.md by hand"
@@ -106,6 +120,10 @@ website)
     key=$(openssl rand -hex 32); printf '\nDISPATCH_WRITE_KEY=%s\n' "$key" >> "$ENVF"; remember DISPATCH_WRITE_KEY "$key"
   else
     remember DISPATCH_WRITE_KEY "$(grep '^DISPATCH_WRITE_KEY=' "$ENVF" | cut -d= -f2-)"
+  fi
+  say "Type-check before building (the running website is not touched if this fails)"
+  if ! (cd "$WEBSITE_BACKEND_DIR" && npx --no-install tsc --noEmit -p .); then
+    restore; die "type-check failed against the live website code — files restored, website unchanged. Send Claude the errors above."
   fi
   say "Build + restart website"
   (cd "$WEBSITE_BACKEND_DIR" && npm run build)

@@ -1,6 +1,11 @@
 import { Router, Request, Response } from 'express'
 import crypto from 'crypto'
+import { z } from 'zod'
 import pool from '../db/pool'
+import { PROMOTION_ACTIVE_SQL } from '../utils/promotions'
+import { calculateOrder, normalizeEmirateName } from '../utils/orderCalculator'
+import { normalizePhone } from '../utils/phone'
+import { insertOrderRecords, sendNewOrderNotifications } from '../services/createOrder'
 
 const router = Router()
 
@@ -46,6 +51,210 @@ function addressText(snapshot: Record<string, unknown> = {}) {
   return [snapshot.street, snapshot.building, snapshot.floor_unit, snapshot.area, snapshot.emirate]
     .filter(Boolean)
     .join(', ')
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+export const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,100}$/
+
+// ─── Staff order: validation ──────────────────────────────────
+export const DispatchOrderSchema = z.object({
+  customer: z.object({
+    id:        z.string().regex(UUID_PATTERN, 'Invalid customer id').optional(),
+    firstName: z.string().trim().min(1).max(100),
+    lastName:  z.string().trim().min(1).max(100),
+    phone:     z.string().min(7).max(25).regex(/^[\d+\-\s()]+$/, 'Invalid phone'),
+    email:     z.string().trim().email().optional().or(z.literal('')),
+  }),
+  address: z.object({
+    emirate:   z.string().trim().min(1).max(50),
+    area:      z.string().trim().min(1).max(255),
+    street:    z.string().trim().max(500).optional(),
+    building:  z.string().trim().max(255).optional(),
+    floorUnit: z.string().trim().max(100).optional(),
+    notes:     z.string().trim().max(1000).optional(),
+    latitude:  z.number().min(-90).max(90).optional(),
+    longitude: z.number().min(-180).max(180).optional(),
+  }).refine(
+    (a) => (a.latitude === undefined) === (a.longitude === undefined),
+    { message: 'latitude and longitude must be provided together', path: ['latitude'] }
+  ),
+  items: z.array(z.object({
+    productId: z.string().trim().min(1).max(100),
+    quantity:  z.number().int().min(1).max(1000),
+    variant:   z.string().trim().max(100).optional(),
+  })).min(1).max(50),
+  paymentMethod:  z.enum(['cash_on_delivery', 'card_on_delivery', 'prepaid']),
+  notes:          z.string().trim().max(1000).optional(),
+  createdBy:      z.string().trim().max(100).optional(),
+  idempotencyKey: z.string().regex(IDEMPOTENCY_KEY_PATTERN, 'idempotencyKey must be 8-100 chars of A-Z a-z 0-9 . _ : -'),
+})
+
+export type DispatchOrderInput = z.infer<typeof DispatchOrderSchema>
+export type DispatchPaymentMethod = DispatchOrderInput['paymentMethod']
+
+/**
+ * Dispatch payment → website orders.payment_method / payment_status.
+ * 'prepaid' is stored as a non-gateway method already marked paid, so no
+ * N-Genius/Tabby flow is ever started for staff orders.
+ */
+export function mapDispatchPayment(method: DispatchPaymentMethod): { paymentMethod: string, paymentStatus: string } {
+  switch (method) {
+    case 'cash_on_delivery': return { paymentMethod: 'cash_on_delivery', paymentStatus: 'pending' }
+    case 'card_on_delivery': return { paymentMethod: 'card_on_delivery', paymentStatus: 'pending' }
+    case 'prepaid':          return { paymentMethod: 'bank_transfer', paymentStatus: 'paid' }
+  }
+}
+
+export function dispatchPaymentMethodFromOrder(paymentMethod: string): DispatchPaymentMethod {
+  if (paymentMethod === 'cash_on_delivery' || paymentMethod === 'card_on_delivery') return paymentMethod
+  return 'prepaid'
+}
+
+export function buildDispatchAddressSnapshot(address: DispatchOrderInput['address']) {
+  return {
+    emirate:    normalizeEmirateName(address.emirate),
+    area:       address.area,
+    street:     address.street || '',
+    building_type: '',
+    building:   address.building || '',
+    floor_unit: address.floorUnit || '',
+    notes:      address.notes || '',
+    latitude:   address.latitude ?? null,
+    longitude:  address.longitude ?? null,
+  }
+}
+
+type ProductCheckRow = {
+  id: string
+  slug: string
+  name_en: string
+  size: string | null
+  is_active: boolean
+  stock_status: string
+  restricted_emirates: string[] | null
+  promotion_active: boolean
+}
+
+/** 404 for unknown products, 409 for products a customer could not buy right now. */
+export function findUnavailableProduct(
+  rows: ProductCheckRow[],
+  items: { productId: string }[],
+  emirate: string
+): { status: 404 | 409, error: string } | null {
+  const normalizedEmirate = normalizeEmirateName(emirate).toLowerCase()
+  for (const item of items) {
+    const product = rows.find((p) => p.id === item.productId || p.slug === item.productId)
+    if (!product) return { status: 404, error: `Product not found: ${item.productId}` }
+    if (!product.is_active || !product.promotion_active) {
+      return { status: 409, error: `Product "${product.name_en}" is not currently sold on the website` }
+    }
+    if (product.stock_status === 'out_of_stock') {
+      return { status: 409, error: `Product "${product.name_en}" is out of stock` }
+    }
+    const restricted = (product.restricted_emirates || [])
+      .some((r) => normalizeEmirateName(r).toLowerCase() === normalizedEmirate)
+    if (restricted) {
+      return { status: 409, error: `Product "${product.name_en}" is not available for delivery to ${emirate}` }
+    }
+  }
+  return null
+}
+
+/** Split order_items.product_size ("<size> - <variant>", see calculateOrder) back into size + variant. */
+export function splitProductSize(productSize: string | null, baseSize: string | null) {
+  const stored = String(productSize || '')
+  const base = String(baseSize || '')
+  if (!stored) return { size: base || null, variant: null }
+  if (base && stored === base) return { size: base, variant: null }
+  if (base && stored.startsWith(`${base} - `)) return { size: base, variant: stored.slice(base.length + 3) || null }
+  if (!base) return { size: null, variant: stored }
+  return { size: stored, variant: null }
+}
+
+export function mapDispatchOrder(order: Record<string, any>, items: Record<string, any>[]) {
+  const address = (order.address_snapshot || {}) as Record<string, unknown>
+  const customer = (order.customer_snapshot || {}) as Record<string, unknown>
+  return {
+    id: String(order.id),
+    orderNumber: String(order.order_number),
+    status: String(order.status || 'pending').toUpperCase(),
+    createdAt: order.created_at,
+    customerId: order.customer_id ? String(order.customer_id) : null,
+    customerName: String(customer.full_name || ''),
+    phone: String(customer.phone || ''),
+    email: customer.email ? String(customer.email) : null,
+    address: addressText(address),
+    emirate: String(address.emirate || ''),
+    area: String(address.area || ''),
+    latitude: coordinate(address.latitude, -90, 90),
+    longitude: coordinate(address.longitude, -180, 180),
+    items: items.map((item) => {
+      const { size, variant } = splitProductSize(item.product_size, item.base_size)
+      return {
+        productId: item.product_id ? String(item.product_id) : null,
+        name: String(item.product_name || ''),
+        size,
+        variant,
+        quantity: Number(item.quantity || 0),
+        unitPrice: Number(item.unit_price || 0),
+        lineTotal: Number(item.total_price || 0),
+      }
+    }),
+    subtotal: Number(order.subtotal || 0),
+    deliveryFee: Number(order.delivery_fee || 0),
+    vat: Number(order.coupon_vat || 0),
+    bottleDeposit: Number(order.bottle_deposit || 0),
+    total: Number(order.total || 0),
+    paymentMethod: dispatchPaymentMethodFromOrder(String(order.payment_method || '')),
+    paymentStatus: String(order.payment_status || '').toUpperCase(),
+  }
+}
+
+export function mapDispatchProduct(row: Record<string, any>) {
+  return {
+    id: String(row.id),
+    slug: String(row.slug),
+    name: String(row.name_en || ''),
+    size: row.size ? String(row.size) : null,
+    category: row.category_name ? String(row.category_name) : null,
+    unitPrice: Number(row.price || 0),
+    imageUrl: row.image_url ? String(row.image_url) : null,
+    // Variants are free-text cart labels on the website (no price impact, no table).
+    variants: [] as { id: string, name: string, unitPrice: number }[],
+    active: true as const,
+  }
+}
+
+type Queryable = { query: (text: string, params?: unknown[]) => Promise<{ rows: any[] }> }
+
+async function loadDispatchOrder(db: Queryable, orderId: string) {
+  const orderResult = await db.query(`
+    SELECT id, order_number, status, created_at, customer_id,
+           customer_snapshot, address_snapshot,
+           subtotal, delivery_fee, coupon_vat, bottle_deposit, total,
+           payment_method, payment_status
+    FROM orders WHERE id = $1
+  `, [orderId])
+  if (!orderResult.rows[0]) return null
+  const itemsResult = await db.query(`
+    SELECT oi.product_id, oi.product_name, oi.product_size, oi.quantity,
+           oi.unit_price, oi.total_price, p.size AS base_size
+    FROM order_items oi
+    LEFT JOIN products p ON p.id = oi.product_id
+    WHERE oi.order_id = $1
+    ORDER BY oi.product_name, oi.id
+  `, [orderId])
+  return mapDispatchOrder(orderResult.rows[0], itemsResult.rows)
+}
+
+async function findIdempotentOrderId(db: Queryable, idempotencyKey: string): Promise<string | null> {
+  const result = await db.query(`
+    SELECT entity_id FROM audit_logs
+    WHERE action = 'dispatch_order_created' AND metadata->>'idempotencyKey' = $1
+    ORDER BY created_at ASC
+    LIMIT 1
+  `, [idempotencyKey])
+  return result.rows[0]?.entity_id ? String(result.rows[0].entity_id) : null
 }
 
 router.get('/overview', async (_req: Request, res: Response) => {
@@ -176,6 +385,35 @@ router.get('/overview', async (_req: Request, res: Response) => {
     res.status(500).json({ error: 'Could not load website dispatch data' })
   } finally {
     client.release()
+  }
+})
+
+// Same active/promotion filter and ordering as public GET /api/products, minus
+// out-of-stock items (calculateOrder refuses them, so customers can't buy them).
+router.get('/products', async (_req: Request, res: Response) => {
+  try {
+    const result = await pool.query(`
+      SELECT p.id, p.slug, p.name_en, p.size, p.price, p.image_url,
+             c.name_en AS category_name
+      FROM products p
+      LEFT JOIN categories c ON p.category_id = c.id
+      WHERE p.is_active = TRUE
+        AND ${PROMOTION_ACTIVE_SQL('p')}
+        AND p.stock_status <> 'out_of_stock'
+      ORDER BY
+        CASE p.stock_status
+          WHEN 'in_stock' THEN 0
+          WHEN 'limited' THEN 1
+          WHEN 'out_of_stock' THEN 2
+          ELSE 3
+        END ASC,
+        c.sort_order ASC,
+        p.created_at ASC
+    `)
+    res.json({ products: result.rows.map(mapDispatchProduct) })
+  } catch (error) {
+    console.error('[Dispatch read] products error:', error)
+    res.status(500).json({ error: 'Could not load website products' })
   }
 })
 
@@ -355,6 +593,159 @@ router.post('/orders/:id/complete', requireDispatchWrite, async (req: Request, r
     await client.query('ROLLBACK').catch(() => undefined)
     console.error('[Dispatch write] delivery completion error:', error)
     return res.status(500).json({ error: 'Could not complete website delivery' })
+  } finally {
+    client.release()
+  }
+})
+
+// Staff-created order. Same pricing, numbering, customer upsert and
+// notifications as public checkout (POST /api/orders), without customer OTP.
+router.post('/orders', requireDispatchWrite, async (req: Request, res: Response) => {
+  const parsed = DispatchOrderSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten().fieldErrors })
+  }
+  const data = parsed.data
+
+  let orderPhone: string
+  try {
+    orderPhone = normalizePhone(data.customer.phone)
+  } catch {
+    return res.status(400).json({ error: 'A valid phone number is required' })
+  }
+
+  try {
+    const existingOrderId = await findIdempotentOrderId(pool, data.idempotencyKey)
+    if (existingOrderId) {
+      const order = await loadDispatchOrder(pool, existingOrderId)
+      if (order) return res.status(200).json({ order, replayed: true })
+    }
+  } catch (error) {
+    console.error('[Dispatch write] idempotency lookup error:', error)
+    return res.status(500).json({ error: 'Could not create website order' })
+  }
+
+  const fullName = `${data.customer.firstName} ${data.customer.lastName}`.trim()
+  const email = data.customer.email || undefined
+  const addressSnapshot = buildDispatchAddressSnapshot(data.address)
+  const orderEmirate = addressSnapshot.emirate
+  const { paymentMethod, paymentStatus } = mapDispatchPayment(data.paymentMethod)
+
+  // Existing customer: the order belongs to that account (like an OTP-verified
+  // account phone); the given phone is the delivery contact on the order.
+  let accountPhone = orderPhone
+  let lines: Awaited<ReturnType<typeof calculateOrder>>['lines']
+  let subtotal: number, coupon_vat: number, bottle_deposit: number, delivery_fee: number, total: number
+  try {
+    if (data.customer.id) {
+      const customerResult = await pool.query('SELECT id, phone FROM customers WHERE id = $1', [data.customer.id])
+      if (!customerResult.rows[0]) return res.status(404).json({ error: 'Customer not found' })
+      accountPhone = String(customerResult.rows[0].phone)
+    }
+
+    const productIds = data.items.map((item) => item.productId)
+    const productResult = await pool.query(`
+      SELECT p.id, p.slug, p.name_en, p.size, p.is_active, p.stock_status, p.restricted_emirates,
+             (${PROMOTION_ACTIVE_SQL('p')}) AS promotion_active
+      FROM products p
+      WHERE p.id::text = ANY($1) OR p.slug = ANY($1)
+    `, [productIds])
+    const unavailable = findUnavailableProduct(productResult.rows, data.items, orderEmirate)
+    if (unavailable) return res.status(unavailable.status).json({ error: unavailable.error })
+  } catch (error) {
+    console.error('[Dispatch write] order pre-check error:', error)
+    return res.status(500).json({ error: 'Could not create website order' })
+  }
+
+  try {
+    ;({ lines, subtotal, coupon_vat, bottle_deposit, delivery_fee, total } = await calculateOrder(
+      data.items.map((item) => ({ id: item.productId, quantity: item.quantity, variant: item.variant })),
+      orderEmirate
+    ))
+  } catch (calcErr: unknown) {
+    const msg = calcErr instanceof Error ? calcErr.message : 'Order calculation failed'
+    return res.status(400).json({ error: msg })
+  }
+
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    // Serialise concurrent requests carrying the same key, then re-check.
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`dispatch_order:${data.idempotencyKey}`])
+    const raceOrderId = await findIdempotentOrderId(client, data.idempotencyKey)
+    if (raceOrderId) {
+      await client.query('ROLLBACK')
+      const order = await loadDispatchOrder(pool, raceOrderId)
+      if (order) return res.status(200).json({ order, replayed: true })
+      return res.status(500).json({ error: 'Could not create website order' })
+    }
+
+    const { customerId, order } = await insertOrderRecords(client, {
+      fullName,
+      accountPhone,
+      orderPhone,
+      email,
+      initialStatus: 'pending',
+      subtotal, coupon_vat, delivery_fee, bottle_deposit,
+      discountAmount: 0,
+      total,
+      paymentMethod,
+      paymentStatus,
+      addressSnapshot,
+      promoCodeId: null,
+      appliedPromoCode: null,
+      incrementPromoUsage: false,
+      notes: [data.address.notes, data.notes].filter(Boolean).join('\n') || undefined,
+      source: 'phone',
+      referral: { source: 'dispatch', medium: 'staff' },
+      lines,
+    })
+
+    await client.query(
+      `INSERT INTO audit_logs (admin_user_id, action, entity_type, entity_id, metadata, ip_address, user_agent)
+       VALUES (NULL, 'dispatch_order_created', 'order', $1, $2, $3, $4)`,
+      [order.id, JSON.stringify({
+        idempotencyKey: data.idempotencyKey,
+        createdBy: data.createdBy || null,
+        source: 'dispatch',
+        orderNumber: order.order_number,
+        customerId,
+        paymentMethod: data.paymentMethod,
+        total,
+      }), req.ip, req.headers['user-agent'] || null]
+    )
+    await client.query('COMMIT')
+
+    sendNewOrderNotifications({
+      orderId:            order.id,
+      order_number:       order.order_number,
+      customer_name:      fullName,
+      customer_phone:     orderPhone,
+      customer_email:     email,
+      total,
+      subtotal,
+      coupon_vat,
+      delivery_fee,
+      bottle_deposit,
+      emirate:            orderEmirate,
+      payment_method:     paymentMethod,
+      address_snapshot:   addressSnapshot,
+      lines,
+    })
+
+    const created = await loadDispatchOrder(pool, order.id).catch((error) => {
+      console.error('[Dispatch write] created order reload error:', error)
+      return null
+    })
+    if (!created) {
+      // Order is committed; return what we know rather than inviting a retry.
+      return res.status(201).json({ order: { id: String(order.id), orderNumber: order.order_number, createdAt: order.created_at, customerId: String(customerId), total } })
+    }
+    return res.status(201).json({ order: created })
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined)
+    console.error('[Dispatch write] create order error:', error)
+    return res.status(500).json({ error: 'Could not create website order' })
   } finally {
     client.release()
   }
