@@ -1,7 +1,14 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { BUNDLED_EMIRATES_FILE, EMIRATE_ORDER, createEmirateBoundaryLoader, parseEmirateBoundaries } = require('../src/emirate-boundaries');
-const { CUSTOMER_ID_RE, createWebsiteDispatchProxy, websiteDispatchBaseUrl } = require('../src/website-dispatch-proxy');
+const { Readable } = require('node:stream');
+const {
+  CUSTOMER_ID_RE,
+  ORDER_BODY_LIMIT_BYTES,
+  createWebsiteDispatchProxy,
+  readJsonBody,
+  websiteDispatchBaseUrl,
+} = require('../src/website-dispatch-proxy');
 
 const quietLogger = { warn() {}, error() {} };
 
@@ -204,4 +211,171 @@ test('website dispatch proxy answers 503 when the website is unreachable and 502
   const html = proxyWith(async () => ({ ok: false, status: 500, json: async () => { throw new SyntaxError('Unexpected token <'); } }));
   const invalid = await runRoute(html, 'customerOrders', fakeReq({ headers: { 'x-api-key': 'admin-key' }, params: { id: 'CUST-1' } }));
   assert.equal(invalid.statusCode, 502);
+});
+
+// --- Website order entry pass-through (products + orders) ---
+
+function orderProxyWith(fetchImpl, options = {}) {
+  return proxyWith(fetchImpl, { writeBaseUrl: 'http://127.0.0.1:4001/api/dispatch/', writeKey: 'server-write-key', ...options });
+}
+
+// A request stream like Express hands to middleware mounted before express.json().
+function streamReq(raw, headers = {}) {
+  const req = Readable.from(raw === undefined ? [] : [Buffer.from(raw)]);
+  const lower = Object.fromEntries(Object.entries(headers).map(([key, value]) => [key.toLowerCase(), value]));
+  req.get = (name) => lower[name.toLowerCase()];
+  return req;
+}
+
+async function readBody(raw, headers = { 'content-type': 'application/json' }) {
+  const req = streamReq(raw, headers);
+  const res = fakeRes();
+  const finished = new Promise((resolve) => {
+    const json = res.json.bind(res);
+    res.json = (body) => { json(body); resolve(); return res; };
+    readJsonBody()(req, res, () => { req.nextCalled = true; resolve(); });
+  });
+  await finished;
+  return { req, res };
+}
+
+test('products and orders pass-through require a matching key', async () => {
+  let fetches = 0;
+  const proxy = orderProxyWith(async () => { fetches += 1; return jsonResponse(200, {}); });
+  for (const handler of ['products', 'createOrder']) {
+    for (const headers of [{}, { 'x-api-key': 'wrong' }, { 'x-dispatch-write-key': 'server-write-key' }, { authorization: 'Bearer admin-key' }]) {
+      const req = fakeReq({ headers, originalUrl: '/api/admin/website-dispatch/orders' });
+      req.body = { items: [] };
+      const res = await runRoute(proxy, handler, req);
+      assert.equal(res.statusCode, 401, `${handler} ${JSON.stringify(headers)}`);
+    }
+  }
+  assert.equal(fetches, 0);
+
+  for (const headers of [{ 'x-api-key': 'admin-key' }, { 'x-dispatch-read-key': 'driver-key' }]) {
+    const req = fakeReq({ headers, originalUrl: '/api/admin/website-dispatch/orders' });
+    req.body = { items: [] };
+    assert.equal((await runRoute(proxy, 'products', req)).statusCode, 200);
+    assert.equal((await runRoute(proxy, 'createOrder', req)).statusCode, 200);
+  }
+});
+
+test('products pass-through forwards GET /products with status, body and a 20 s timeout', async () => {
+  const calls = [];
+  const proxy = orderProxyWith(async (url, options) => { calls.push({ url, options }); return jsonResponse(200, { products: [{ id: 'P-1' }] }); }, { readKey: 'website-read-key' });
+  const res = await runRoute(proxy, 'products', fakeReq({ headers: { 'x-api-key': 'admin-key' }, originalUrl: '/api/admin/website-dispatch/products?active=1' }));
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body, { products: [{ id: 'P-1' }] });
+  assert.equal(res.headers['cache-control'], 'no-store');
+  assert.equal(calls[0].url, 'http://127.0.0.1:4001/api/dispatch/products?active=1');
+  assert.equal(calls[0].options.method, undefined);
+  assert.equal(calls[0].options.headers['x-dispatch-read-key'], 'website-read-key');
+  assert.equal('x-dispatch-write-key' in calls[0].options.headers, false);
+  assert.ok(calls[0].options.signal, 'request has a timeout');
+});
+
+test('orders pass-through injects the server write key and ignores a client-supplied one', async () => {
+  const calls = [];
+  const proxy = orderProxyWith(async (url, options) => { calls.push({ url, options }); return jsonResponse(201, { id: 'W-9' }); });
+  const req = fakeReq({
+    headers: { 'x-api-key': 'admin-key', 'x-dispatch-write-key': 'client-write-key', 'X-Dispatch-Write-Key': 'client-2' },
+    originalUrl: '/api/admin/website-dispatch/orders?writeKey=client',
+  });
+  req.body = { customerId: 'CUST-1', items: [{ productId: 'P-1', quantity: 2 }], 'x-dispatch-write-key': 'in-body' };
+  const res = await runRoute(proxy, 'createOrder', req);
+
+  assert.equal(res.statusCode, 201);
+  assert.deepEqual(res.body, { id: 'W-9' });
+  assert.equal(res.headers['cache-control'], 'no-store');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'http://127.0.0.1:4001/api/dispatch/orders', 'write base, no client query');
+  assert.equal(calls[0].options.method, 'POST');
+  assert.equal(calls[0].options.headers['x-dispatch-write-key'], 'server-write-key');
+  assert.equal(calls[0].options.headers['content-type'], 'application/json');
+  assert.equal(Object.values(calls[0].options.headers).includes('client-write-key'), false);
+  assert.equal('x-api-key' in calls[0].options.headers, false, 'client auth is not forwarded');
+  assert.deepEqual(JSON.parse(calls[0].options.body), req.body);
+  assert.ok(calls[0].options.signal, 'request has a timeout');
+});
+
+test('orders pass-through returns the website status and body (201/200/400), 503 when unreachable or unconfigured', async () => {
+  for (const [status, body] of [[201, { id: 'W-1' }], [200, { id: 'W-1', duplicate: true }], [400, { error: 'items is required' }]]) {
+    const proxy = orderProxyWith(async () => jsonResponse(status, body));
+    const req = fakeReq({ headers: { 'x-api-key': 'driver-key' } });
+    req.body = { items: [] };
+    const res = await runRoute(proxy, 'createOrder', req);
+    assert.equal(res.statusCode, status);
+    assert.deepEqual(res.body, body);
+  }
+
+  const down = orderProxyWith(async () => { throw new TypeError('fetch failed'); });
+  for (const handler of ['products', 'createOrder']) {
+    const req = fakeReq({ headers: { 'x-api-key': 'admin-key' } });
+    req.body = { items: [] };
+    const res = await runRoute(down, handler, req);
+    assert.equal(res.statusCode, 503, handler);
+    assert.deepEqual(res.body, { error: 'The website dispatch API is unreachable' });
+  }
+
+  const timedOut = orderProxyWith(async (_url, { signal }) => new Promise((_resolve, reject) => {
+    signal.addEventListener('abort', () => reject(signal.reason));
+  }), { orderEntryTimeoutMs: 20 });
+  const slowReq = fakeReq({ headers: { 'x-api-key': 'admin-key' } });
+  slowReq.body = { items: [] };
+  assert.equal((await runRoute(timedOut, 'createOrder', slowReq)).statusCode, 503);
+
+  let fetches = 0;
+  const noWriteKey = orderProxyWith(async () => { fetches += 1; return jsonResponse(201, {}); }, { writeKey: '' });
+  const req = fakeReq({ headers: { 'x-api-key': 'admin-key' } });
+  req.body = { items: [] };
+  const unconfigured = await runRoute(noWriteKey, 'createOrder', req);
+  assert.equal(unconfigured.statusCode, 503);
+  assert.equal(fetches, 0);
+});
+
+test('orders write base defaults to the overview base and createOrder rejects a missing body', async () => {
+  const calls = [];
+  const proxy = proxyWith(async (url) => { calls.push(url); return jsonResponse(201, {}); }, { writeKey: 'k' });
+  assert.equal(proxy.ordersUrl, 'http://127.0.0.1:4001/api/dispatch/orders');
+  for (const body of [undefined, [], 'text']) {
+    const req = fakeReq({ headers: { 'x-api-key': 'admin-key' } });
+    req.body = body;
+    assert.equal((await runRoute(proxy, 'createOrder', req)).statusCode, 400, JSON.stringify(body));
+  }
+  assert.equal(calls.length, 0);
+});
+
+test('readJsonBody accepts JSON objects up to 64 KB and rejects larger or non-JSON bodies', async () => {
+  const ok = await readBody(JSON.stringify({ items: [{ productId: 'P-1', quantity: 1 }] }), { 'content-type': 'application/json; charset=utf-8' });
+  assert.equal(ok.req.nextCalled, true);
+  assert.deepEqual(ok.req.body, { items: [{ productId: 'P-1', quantity: 1 }] });
+  assert.equal(ok.req._body, true, 'the global express.json() parser will skip it');
+
+  const atLimit = JSON.stringify({ note: 'x'.repeat(ORDER_BODY_LIMIT_BYTES - 11) });
+  assert.equal(Buffer.byteLength(atLimit), ORDER_BODY_LIMIT_BYTES);
+  assert.equal((await readBody(atLimit)).req.nextCalled, true);
+
+  const tooLarge = JSON.stringify({ note: 'x'.repeat(ORDER_BODY_LIMIT_BYTES) });
+  for (const headers of [{ 'content-type': 'application/json' }, { 'content-type': 'application/json', 'content-length': String(tooLarge.length) }]) {
+    const { req, res } = await readBody(tooLarge, headers);
+    assert.equal(res.statusCode, 413, JSON.stringify(headers));
+    assert.deepEqual(res.body, { error: 'Request body too large' });
+    assert.equal(req.nextCalled, undefined);
+  }
+
+  for (const [raw, headers] of [
+    ['{"items":[]}', {}],
+    ['{"items":[]}', { 'content-type': 'text/plain' }],
+    ['items=1', { 'content-type': 'application/x-www-form-urlencoded' }],
+    ['{not json', { 'content-type': 'application/json' }],
+    ['', { 'content-type': 'application/json' }],
+    ['[1,2]', { 'content-type': 'application/json' }],
+    ['"text"', { 'content-type': 'application/json' }],
+    ['null', { 'content-type': 'application/json' }],
+  ]) {
+    const { req, res } = await readBody(raw, headers);
+    assert.equal(res.statusCode, 400, `${raw} ${JSON.stringify(headers)}`);
+    assert.equal(res.headers['cache-control'], 'no-store');
+    assert.equal(req.nextCalled, undefined);
+  }
 });

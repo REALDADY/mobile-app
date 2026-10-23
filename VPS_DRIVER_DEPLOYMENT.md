@@ -208,12 +208,14 @@ Don't touch the website's existing nginx server blocks.
 ## 7. Dispatch console on the office PC
 
 On the VPS the website's `/api/dispatch/*` only answers loopback (or a key) and nginx blocks it publicly. The
-driver API therefore re-exposes the two read endpoints the console needs, protected by the API keys:
+driver API therefore re-exposes the endpoints the console needs, protected by the API keys:
 
 | Driver API (public, key required)                        | Website (loopback)                         |
 |----------------------------------------------------------|--------------------------------------------|
 | `GET /api/admin/website-dispatch/overview`               | `GET /api/dispatch/overview`               |
 | `GET /api/admin/website-dispatch/customers/:id/orders`   | `GET /api/dispatch/customers/:id/orders`   |
+| `GET /api/admin/website-dispatch/products`               | `GET /api/dispatch/products`               |
+| `POST /api/admin/website-dispatch/orders`                | `POST ${WEBSITE_DISPATCH_WRITE_BASE_URL}/orders` |
 
 - Auth: header `x-dispatch-read-key` **or** `x-api-key` must equal `ADMIN_API_KEY` or `DRIVER_API_KEY`;
   anything else gets `401`. There is no loopback exception on these routes.
@@ -221,6 +223,12 @@ driver API therefore re-exposes the two read endpoints the console needs, protec
 - The website's status and JSON body are passed through unchanged with `Cache-Control: no-store`; query strings
   are forwarded. If the website is unreachable or slower than 10 s, the API answers `503 { "error": ... }`.
 - The website base URL is `WEBSITE_DISPATCH_URL` without `/overview`.
+- `products` and `orders` (order entry from the console) use a 20 s timeout instead of 10 s; status and JSON
+  are passed through the same way (`201`/`200`/`400` …), and an unreachable website gives `503`.
+- `POST …/orders` takes a JSON object body of at most 64 KB (`Content-Type: application/json`): larger bodies get
+  `413`, non-JSON or invalid JSON gets `400`. The driver API adds `x-dispatch-write-key: WEBSITE_DISPATCH_WRITE_KEY`
+  itself and never forwards client headers, so a write key sent by the console is ignored. If
+  `WEBSITE_DISPATCH_WRITE_KEY` is not set, the endpoint answers `503` without calling the website.
 
 Set these in the console's environment on the office PC (placeholders; use the real host and key):
 

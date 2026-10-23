@@ -37,7 +37,7 @@ const {
 const { computeDaySummary, dedupeDeliveryAttempts } = require('./day-summary-service');
 const { createDriverStorage, resolveSupabaseConfig } = require('./store');
 const { createEmirateBoundaryLoader } = require('./emirate-boundaries');
-const { createWebsiteDispatchProxy } = require('./website-dispatch-proxy');
+const { createWebsiteDispatchProxy, readJsonBody } = require('./website-dispatch-proxy');
 require('dotenv').config();
 
 const app = express();
@@ -1408,6 +1408,9 @@ app.use(cors({
   },
   credentials: true,
 }));
+// Website order entry pass-through: key check, then its own 64 KB JSON reader, so the 8 MB parser below
+// skips it. (websiteDispatchProxy is defined further down; it is only dereferenced per request.)
+app.post('/api/admin/website-dispatch/orders', (req, res, next) => websiteDispatchProxy.requireKey(req, res, next), readJsonBody());
 app.use(express.json({ limit: '8mb' }));
 
 // --- Health Check ---
@@ -4049,9 +4052,13 @@ const websiteDispatchProxy = createWebsiteDispatchProxy({
   overviewUrl: WEBSITE_DISPATCH_URL,
   apiKeys: [ADMIN_API_KEY, DRIVER_API_KEY],
   readKey: process.env.WEBSITE_DISPATCH_READ_KEY || '',
+  writeBaseUrl: WEBSITE_DISPATCH_WRITE_BASE_URL,
+  writeKey: WEBSITE_DISPATCH_WRITE_KEY,
 });
 app.get('/api/admin/website-dispatch/overview', websiteDispatchProxy.requireKey, websiteDispatchProxy.overview);
 app.get('/api/admin/website-dispatch/customers/:id/orders', websiteDispatchProxy.requireKey, websiteDispatchProxy.customerOrders);
+app.get('/api/admin/website-dispatch/products', websiteDispatchProxy.requireKey, websiteDispatchProxy.products);
+app.post('/api/admin/website-dispatch/orders', websiteDispatchProxy.requireKey, websiteDispatchProxy.createOrder);
 
 // --- Admin: Drivers ---
 app.get('/api/admin/dispatch/overview', requireDispatchReadOnly, async (req, res) => {
